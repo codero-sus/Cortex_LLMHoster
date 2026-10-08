@@ -129,6 +129,22 @@ def test_inference_request_limit_is_configurable_and_bounded_by_connection_pool(
         )
 
 
+def test_invalid_optimization_profile_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="optimization_profile must be"):
+        Settings.from_mapping(
+            {
+                "models": [
+                    {
+                        "id": "local",
+                        "model_path": "/models/local.gguf",
+                        "optimization_profile": "maximus",
+                    }
+                ]
+            },
+            environ={},
+        )
+
+
 def test_local_model_path_must_be_gguf(tmp_path) -> None:
     with pytest.raises(ConfigurationError, match="must point to a GGUF file"):
         Settings.from_mapping(

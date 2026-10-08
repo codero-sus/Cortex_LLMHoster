@@ -52,6 +52,7 @@ class ModelConfig:
     mlock: bool = False
     embedding: bool = False
     mmproj_path: str | None = None
+    optimization_profile: str = "balanced"
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +174,16 @@ class Settings:
                 raise ConfigurationError(
                     f"{prefix}.runtime must be 'llama.cpp'; Cortex hosts local GGUF models only."
                 )
+            optimization_profile = row.get("optimization_profile", "balanced")
+            if not isinstance(optimization_profile, str):
+                raise ConfigurationError(
+                    f"{prefix}.optimization_profile must be 'balanced' or 'ultra'."
+                )
+            optimization_profile = optimization_profile.strip().lower()
+            if optimization_profile not in {"balanced", "ultra"}:
+                raise ConfigurationError(
+                    f"{prefix}.optimization_profile must be 'balanced' or 'ultra'."
+                )
 
             model_path = row.get("model_path")
             if not isinstance(model_path, str) or not model_path.strip():
@@ -241,6 +252,7 @@ class Settings:
                 id=model_id,
                 upstream_model=upstream_model,
                 runtime=runtime,
+                optimization_profile=optimization_profile,
                 model_path=model_path,
                 threads=threads,
                 threads_batch=threads_batch,

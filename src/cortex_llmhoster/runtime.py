@@ -69,6 +69,14 @@ def build_llama_command(
         raise ValueError("Local llama.cpp models require model_path.")
     threads = model.threads or automatic_threads(cpu_count)
     threads_batch = model.threads_batch or threads
+    ultra = model.optimization_profile.strip().lower() == "ultra"
+    batch_size = max(model.batch_size, 512) if ultra else model.batch_size
+    ubatch_size = min(batch_size, max(model.ubatch_size, 128)) if ultra else model.ubatch_size
+    flash_attn = model.flash_attn
+    if ultra and model.gpu_layers != 0 and flash_attn == "auto":
+        flash_attn = "on"
+    cache_type_k = "q8_0" if ultra else model.cache_type_k
+    cache_type_v = "q8_0" if ultra else model.cache_type_v
     args = [
         binary,
         "--model",
@@ -88,17 +96,17 @@ def build_llama_command(
         "--n-gpu-layers",
         str(model.gpu_layers),
         "--batch-size",
-        str(model.batch_size),
+        str(batch_size),
         "--ubatch-size",
-        str(model.ubatch_size),
+        str(ubatch_size),
         "--parallel",
         str(model.parallel),
         "--flash-attn",
-        model.flash_attn,
+        flash_attn,
         "--cache-type-k",
-        model.cache_type_k,
+        cache_type_k,
         "--cache-type-v",
-        model.cache_type_v,
+        cache_type_v,
     ]
     if not model.use_mmap:
         args.append("--no-mmap")

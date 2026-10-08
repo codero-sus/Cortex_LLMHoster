@@ -24,6 +24,8 @@ max_inference_requests = 8
 [[models]]
 id = "qwen-local"
 runtime = "llama.cpp"
+# Choose "ultra" for aggressive batch/KV-cache tuning; validate RAM/VRAM first.
+optimization_profile = "balanced"
 model_path = "/models/qwen-instruct-q4_k_m.gguf"
 default = true
 

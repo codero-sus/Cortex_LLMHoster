@@ -115,6 +115,7 @@ controls:
 | Setting | Purpose |
 | --- | --- |
 | `gpu_layers` | `0` for CPU-only; `-1` for maximum supported GPU offload; positive values offload that many layers. |
+| `optimization_profile` | `balanced` uses configured tuning. `ultra` applies at least 512/128 batch/micro-batch sizes, q8_0 KV caches, and enables Flash Attention for GPU offload when its setting is `auto`. CPU/GPU selection remains explicit through `gpu_layers`. |
 | `threads` / `threads_batch` | CPU inference and prompt-processing threads; `0` selects Cortex's conservative automatic count. |
 | `context_size` | Context window in tokens. Reducing it lowers KV-cache memory use. |
 | `batch_size` / `ubatch_size` | Prompt-processing batch limits; smaller values can reduce peak memory. |
@@ -130,6 +131,15 @@ For a constrained CPU-only device, start with `gpu_layers = 0`, `parallel = 1`,
 a modest `context_size` (for example 1024–2048), and smaller batch sizes. For a
 GPU build, try `gpu_layers = -1`, then lower the offload count if VRAM is
 insufficient. These are starting points, not universal performance guarantees.
+
+The optional `optimization_profile = "ultra"` is an aggressive, backend-dependent
+preset, not an auto-benchmark. It keeps CPU-only mode when `gpu_layers = 0`; on
+GPU offload it can enable Flash Attention when configured as `auto`. ULTRA raises
+batch/micro-batch minimums and uses q8_0 KV caches; this can increase scratch
+RAM/VRAM while reducing KV-cache memory, and may affect output quality or fail
+on a runtime that lacks the requested feature. Try it on the target model/device
+and return to `balanced` if memory use or compatibility is poor. It is not a
+claim of measured throughput improvement.
 
 Cortex also bounds active inference requests (`max_inference_requests`; default
 8, and never above `max_connections`) before the inference handler parses
