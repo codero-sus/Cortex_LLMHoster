@@ -53,7 +53,7 @@ async def test_dashboard_is_served_and_admin_api_requires_key(tmp_path) -> None:
     assert page.status_code == 200
     assert "Cortex — Local LLM Hoster" in page.text
     assert "Chat playground" in page.text
-    assert "ULTRA (aggressive)" in page.text
+    assert "ULTRA (+1)" in page.text
     assert page.headers["x-frame-options"] == "DENY"
     assert state.status_code == 503
     assert state.json()["error"]["code"] == "admin_auth_not_configured"
@@ -124,7 +124,7 @@ async def test_local_model_fields_round_trip_through_dashboard(tmp_path) -> None
             {
                 "id": "tiny-local",
                 "runtime": "llama.cpp",
-                "optimization_profile": "ultra",
+                "optimization_level": 1,
                 "model_path": "/models/tiny-q4.gguf",
                 "mmproj_path": "/models/projector.gguf",
                 "gpu_layers": -1,
@@ -146,7 +146,7 @@ async def test_local_model_fields_round_trip_through_dashboard(tmp_path) -> None
     assert saved.status_code == 200
     local_model = state.json()["models"][0]
     assert local_model["runtime"] == "llama.cpp"
-    assert local_model["optimization_profile"] == "ultra"
+    assert local_model["optimization_level"] == 1
     assert local_model["gpu_layers"] == -1
     assert local_model["context_size"] == 1024
     assert local_model["embedding"] is True
@@ -154,10 +154,10 @@ async def test_local_model_fields_round_trip_through_dashboard(tmp_path) -> None
     assert state.json()["runtime"]["models"]["tiny-local"]["status"] == "error"
     stored_config = json.loads(local_config.read_text(encoding="utf-8"))
     assert "dashboard-secret" not in json.dumps(stored_config)
-    assert stored_config["models"][0]["optimization_profile"] == "ultra"
+    assert stored_config["models"][0]["optimization_level"] == 1
     assert exported.status_code == 200
     assert exported.json()["models"][0]["runtime"] == "llama.cpp"
-    assert exported.json()["models"][0]["optimization_profile"] == "ultra"
+    assert exported.json()["models"][0]["optimization_level"] == 1
     assert exported.json()["models"][0]["embedding"] is True
 
 

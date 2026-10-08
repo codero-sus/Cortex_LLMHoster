@@ -5,6 +5,7 @@ import sys
 import uvicorn
 
 from cortex_llmhoster import cli
+from cortex_llmhoster.config import Settings
 
 
 def test_cli_passes_resolved_listener_and_workers_to_uvicorn(tmp_path, monkeypatch) -> None:
@@ -42,3 +43,14 @@ workers = 2
     assert observed["host"] == "0.0.0.0"
     assert observed["port"] == 9123
     assert observed["workers"] == 3
+
+
+def test_cli_uses_default_port_8624(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+    monkeypatch.setattr(cli.Settings, "load", lambda: Settings())
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: observed.update(kwargs))
+    monkeypatch.setattr(sys, "argv", ["cortex-llmhoster"])
+
+    cli.main()
+
+    assert observed["port"] == 8624

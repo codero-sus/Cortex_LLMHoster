@@ -5,6 +5,11 @@ import pytest
 from cortex_llmhoster.config import ConfigurationError, Settings
 
 
+def test_default_listener_port_is_8624() -> None:
+    assert Settings().port == 8624
+    assert Settings.from_mapping({}, environ={}).port == 8624
+
+
 def test_loads_local_gguf_toml_and_reads_api_key_from_environment(tmp_path) -> None:
     config = tmp_path / "cortex.toml"
     config.write_text(
@@ -129,15 +134,15 @@ def test_inference_request_limit_is_configurable_and_bounded_by_connection_pool(
         )
 
 
-def test_invalid_optimization_profile_is_rejected() -> None:
-    with pytest.raises(ConfigurationError, match="optimization_profile must be"):
+def test_invalid_optimization_level_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="optimization_level must be"):
         Settings.from_mapping(
             {
                 "models": [
                     {
                         "id": "local",
                         "model_path": "/models/local.gguf",
-                        "optimization_profile": "maximus",
+                        "optimization_level": 2,
                     }
                 ]
             },

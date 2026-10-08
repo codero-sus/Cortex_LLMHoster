@@ -57,8 +57,14 @@ def test_build_llama_command_uses_args_and_local_low_memory_options() -> None:
     assert command[command.index("--mmproj") + 1] == "/models/projector.gguf"
 
 
-def test_ultra_profile_tunes_cpu_and_gpu_commands_without_forcing_device_mode() -> None:
-    cpu_model = local_model(optimization_profile="ultra", gpu_layers=0)
+def test_optimization_levels_tune_cpu_and_gpu_commands_without_forcing_device_mode() -> None:
+    efficient_model = local_model(optimization_level=-1, gpu_layers=0)
+    efficient_command = build_llama_command("/opt/llama-server", efficient_model, 8765, cpu_count=4)
+    assert efficient_command[efficient_command.index("--batch-size") + 1] == "128"
+    assert efficient_command[efficient_command.index("--ubatch-size") + 1] == "32"
+    assert efficient_command[efficient_command.index("--cache-type-k") + 1] == "f16"
+
+    cpu_model = local_model(optimization_level=1, gpu_layers=0)
     cpu_command = build_llama_command("/opt/llama-server", cpu_model, 8765, cpu_count=4)
 
     assert cpu_command[cpu_command.index("--n-gpu-layers") + 1] == "0"
@@ -68,13 +74,13 @@ def test_ultra_profile_tunes_cpu_and_gpu_commands_without_forcing_device_mode() 
     assert cpu_command[cpu_command.index("--cache-type-v") + 1] == "q8_0"
     assert cpu_command[cpu_command.index("--flash-attn") + 1] == "auto"
 
-    gpu_model = local_model(optimization_profile="ultra", gpu_layers=-1, flash_attn="auto")
+    gpu_model = local_model(optimization_level=1, gpu_layers=-1, flash_attn="auto")
     gpu_command = build_llama_command("/opt/llama-server", gpu_model, 8765, cpu_count=4)
     assert gpu_command[gpu_command.index("--n-gpu-layers") + 1] == "-1"
     assert gpu_command[gpu_command.index("--flash-attn") + 1] == "on"
 
     compatible_override = local_model(
-        optimization_profile="ultra",
+        optimization_level=1,
         gpu_layers=4,
         flash_attn="off",
         batch_size=1024,
@@ -114,7 +120,7 @@ def test_local_model_config_accepts_gguf_cpu_and_gpu_controls() -> None:
     model = settings.models["tiny-local"]
     assert settings.default_model == "tiny-local"
     assert model.runtime == "llama.cpp"
-    assert model.optimization_profile == "ultra"
+    assert model.optimization_level == 1
     assert model.gpu_layers == -1
     assert model.embedding is True
     assert model.mmproj_path == "/models/projector.gguf"
