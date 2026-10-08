@@ -147,7 +147,7 @@ def _public_settings(settings: Settings) -> dict[str, Any]:
                 "upstream_model": model.upstream_model,
                 "default": model.id == settings.default_model,
                 "runtime": model.runtime,
-                "optimization_profile": model.optimization_profile,
+                "optimization_level": model.optimization_level,
                 "model_path": model.model_path,
                 "threads": model.threads,
                 "threads_batch": model.threads_batch,
@@ -179,7 +179,7 @@ def _persistable_settings(settings: Settings) -> dict[str, Any]:
             "id": model.id,
             "upstream_model": model.upstream_model,
             "runtime": model.runtime,
-            "optimization_profile": model.optimization_profile,
+            "optimization_level": model.optimization_level,
             "model_path": model.model_path,
             "threads": model.threads,
             "threads_batch": model.threads_batch,
@@ -265,7 +265,9 @@ def _candidate_settings(payload: Any, current: Settings) -> Settings:
                 "id": raw_model.get("id"),
                 "upstream_model": raw_model.get("upstream_model") or raw_model.get("id"),
                 "runtime": raw_model.get("runtime", "llama.cpp"),
-                "optimization_profile": raw_model.get("optimization_profile", "balanced"),
+                "optimization_level": raw_model.get(
+                    "optimization_level", raw_model.get("optimization_profile", 0)
+                ),
                 "model_path": raw_model.get("model_path"),
                 "threads": raw_model.get("threads", 0),
                 "threads_batch": raw_model.get("threads_batch", 0),

@@ -69,9 +69,17 @@ def build_llama_command(
         raise ValueError("Local llama.cpp models require model_path.")
     threads = model.threads or automatic_threads(cpu_count)
     threads_batch = model.threads_batch or threads
-    ultra = model.optimization_profile.strip().lower() == "ultra"
-    batch_size = max(model.batch_size, 512) if ultra else model.batch_size
-    ubatch_size = min(batch_size, max(model.ubatch_size, 128)) if ultra else model.ubatch_size
+    optimization_level = model.optimization_level
+    ultra = optimization_level == 1
+    if optimization_level == -1:
+        batch_size = min(model.batch_size, 128)
+        ubatch_size = min(model.ubatch_size, batch_size, 32)
+    elif ultra:
+        batch_size = max(model.batch_size, 512)
+        ubatch_size = min(batch_size, max(model.ubatch_size, 128))
+    else:
+        batch_size = model.batch_size
+        ubatch_size = model.ubatch_size
     flash_attn = model.flash_attn
     if ultra and model.gpu_layers != 0 and flash_attn == "auto":
         flash_attn = "on"

@@ -52,7 +52,7 @@ class ModelConfig:
     mlock: bool = False
     embedding: bool = False
     mmproj_path: str | None = None
-    optimization_profile: str = "balanced"
+    optimization_level: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,7 +64,7 @@ class Settings:
     api_key: str | None = None
     api_key_env: str = "CORTEX_API_KEY"
     host: str = "0.0.0.0"
-    port: int = 8000
+    port: int = 8624
     workers: int = 1
     log_level: str = "warning"
     access_log: bool = False
@@ -174,16 +174,31 @@ class Settings:
                 raise ConfigurationError(
                     f"{prefix}.runtime must be 'llama.cpp'; Cortex hosts local GGUF models only."
                 )
-            optimization_profile = row.get("optimization_profile", "balanced")
-            if not isinstance(optimization_profile, str):
-                raise ConfigurationError(
-                    f"{prefix}.optimization_profile must be 'balanced' or 'ultra'."
-                )
-            optimization_profile = optimization_profile.strip().lower()
-            if optimization_profile not in {"balanced", "ultra"}:
-                raise ConfigurationError(
-                    f"{prefix}.optimization_profile must be 'balanced' or 'ultra'."
-                )
+            raw_optimization_level = row.get("optimization_level")
+            if raw_optimization_level is None:
+                raw_optimization_level = row.get("optimization_profile", 0)
+            profile_levels = {"efficient": -1, "eco": -1, "balanced": 0, "ultra": 1}
+            if isinstance(raw_optimization_level, bool):
+                raise ConfigurationError(f"{prefix}.optimization_level must be -1, 0, or 1.")
+            if isinstance(raw_optimization_level, str):
+                normalized_level = raw_optimization_level.strip().lower()
+                if normalized_level in profile_levels:
+                    optimization_level = profile_levels[normalized_level]
+                else:
+                    try:
+                        optimization_level = int(normalized_level)
+                    except ValueError as exc:
+                        raise ConfigurationError(
+                            f"{prefix}.optimization_level must be -1, 0, or 1."
+                        ) from exc
+            elif isinstance(raw_optimization_level, int):
+                optimization_level = raw_optimization_level
+            elif isinstance(raw_optimization_level, float) and raw_optimization_level.is_integer():
+                optimization_level = int(raw_optimization_level)
+            else:
+                raise ConfigurationError(f"{prefix}.optimization_level must be -1, 0, or 1.")
+            if optimization_level not in {-1, 0, 1}:
+                raise ConfigurationError(f"{prefix}.optimization_level must be -1, 0, or 1.")
 
             model_path = row.get("model_path")
             if not isinstance(model_path, str) or not model_path.strip():
@@ -252,7 +267,7 @@ class Settings:
                 id=model_id,
                 upstream_model=upstream_model,
                 runtime=runtime,
-                optimization_profile=optimization_profile,
+                optimization_level=optimization_level,
                 model_path=model_path,
                 threads=threads,
                 threads_batch=threads_batch,
@@ -316,7 +331,7 @@ class Settings:
         host = env.get("CORTEX_HOST", server.get("host", "0.0.0.0"))
         if not isinstance(host, str) or not host:
             raise ConfigurationError("CORTEX_HOST / server.host must be a non-empty string.")
-        port = setting("port", "CORTEX_PORT", 8000, int)
+        port = setting("port", "CORTEX_PORT", 8624, int)
         workers = setting("workers", "CORTEX_WORKERS", 1, int)
         if not 1 <= port <= 65535:
             raise ConfigurationError("port must be between 1 and 65535.")

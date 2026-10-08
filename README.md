@@ -60,7 +60,7 @@ file on this machine. For example:
 ```toml
 [server]
 host = "0.0.0.0"
-port = 8000
+port = 8624
 workers = 1
 api_key_env = "CORTEX_API_KEY"
 default_model = "qwen-local"
@@ -90,14 +90,14 @@ python -m cortex_llmhoster
 ```
 
 The same command is available as `cortex-llmhoster`. Cortex binds to
-`0.0.0.0:8000` by default; open `http://localhost:8000/` for the dashboard.
+`0.0.0.0:8624` by default; open `http://localhost:8624/` for the dashboard.
 The configured default local model starts automatically. Add other GGUF files
 in the **Models** section and use **Start** when you want to load one.
 
 Send a test chat request:
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8624/v1/chat/completions \
   -H "Authorization: Bearer $CORTEX_API_KEY" \
   -H 'Content-Type: application/json' \
   -d '{"model":"qwen-local","messages":[{"role":"user","content":"Hi"}],"stream":true}'
@@ -115,7 +115,7 @@ controls:
 | Setting | Purpose |
 | --- | --- |
 | `gpu_layers` | `0` for CPU-only; `-1` for maximum supported GPU offload; positive values offload that many layers. |
-| `optimization_profile` | `balanced` uses configured tuning. `ultra` applies at least 512/128 batch/micro-batch sizes, q8_0 KV caches, and enables Flash Attention for GPU offload when its setting is `auto`. CPU/GPU selection remains explicit through `gpu_layers`. |
+| `optimization_level` | `-1` caps batches at 128/32 for lower memory; `0` uses configured tuning; `1` is ULTRA (batch minima 512/128, q8_0 KV cache, and GPU Flash Attention when set to `auto`). Device selection remains explicit through `gpu_layers`. |
 | `threads` / `threads_batch` | CPU inference and prompt-processing threads; `0` selects Cortex's conservative automatic count. |
 | `context_size` | Context window in tokens. Reducing it lowers KV-cache memory use. |
 | `batch_size` / `ubatch_size` | Prompt-processing batch limits; smaller values can reduce peak memory. |
@@ -132,14 +132,15 @@ a modest `context_size` (for example 1024–2048), and smaller batch sizes. For 
 GPU build, try `gpu_layers = -1`, then lower the offload count if VRAM is
 insufficient. These are starting points, not universal performance guarantees.
 
-The optional `optimization_profile = "ultra"` is an aggressive, backend-dependent
-preset, not an auto-benchmark. It keeps CPU-only mode when `gpu_layers = 0`; on
-GPU offload it can enable Flash Attention when configured as `auto`. ULTRA raises
-batch/micro-batch minimums and uses q8_0 KV caches; this can increase scratch
-RAM/VRAM while reducing KV-cache memory, and may affect output quality or fail
-on a runtime that lacks the requested feature. Try it on the target model/device
-and return to `balanced` if memory use or compatibility is poor. It is not a
-claim of measured throughput improvement.
+The model editor provides three optimization levels: `-1` (Efficient), `0`
+(Balanced), and `1` (ULTRA). Efficient caps batch/micro-batch sizes at 128/32;
+Balanced uses the configured values; ULTRA raises their minimums to 512/128,
+uses q8_0 KV caches, and enables Flash Attention for GPU offload when set to
+`auto`. The levels do not change `gpu_layers` or auto-select an accelerator.
+ULTRA can need more scratch RAM/VRAM, q8_0 may affect output quality, and an
+unsupported llama.cpp build may reject its options. These are hardware-dependent
+presets, not measured throughput claims. Older `optimization_profile =
+"balanced"` / `"ultra"` config values remain accepted as levels 0 / 1.
 
 Cortex also bounds active inference requests (`max_inference_requests`; default
 8, and never above `max_connections`) before the inference handler parses
@@ -182,7 +183,7 @@ settings change.
 | --- | --- | --- |
 | `CORTEX_CONFIG` | `./cortex.toml` | TOML configuration path. |
 | `CORTEX_ADMIN_CONFIG` | sibling `cortex.local.json` | Dashboard override file path. |
-| `CORTEX_HOST` / `CORTEX_PORT` | `0.0.0.0` / `8000` | Cortex listen address. |
+| `CORTEX_HOST` / `CORTEX_PORT` | `0.0.0.0` / `8624` | Cortex listen address. |
 | `CORTEX_WORKERS` | `1` | Uvicorn worker count; local model hosting requires one. |
 | `CORTEX_LLAMA_SERVER` | `PATH` lookup | Path to the `llama-server` executable. |
 | `CORTEX_API_KEY` | unset | Bearer key for the API and admin endpoints. |
