@@ -1,0 +1,52 @@
+# Local GGUF hosting with llama.cpp. Copy to cortex.toml and update model_path.
+# Install a llama.cpp build separately; set llama_server_path if not on PATH.
+
+[server]
+host = "0.0.0.0"
+port = 8000
+workers = 1
+log_level = "warning"
+access_log = false
+api_key_env = "CORTEX_API_KEY"
+default_model = "qwen-local"
+# Optional absolute path to llama-server; defaults to PATH lookup.
+# llama_server_path = "/usr/local/bin/llama-server"
+max_connections = 512
+max_keepalive_connections = 128
+keepalive_expiry = 30.0
+connect_timeout = 5.0
+read_timeout = 300.0
+write_timeout = 60.0
+pool_timeout = 5.0
+max_json_body_bytes = 16777216
+max_inference_requests = 8
+
+[[models]]
+id = "qwen-local"
+runtime = "llama.cpp"
+model_path = "/models/qwen-instruct-q4_k_m.gguf"
+default = true
+
+# CPU-only: gpu_layers = 0. For a compatible GPU build, use -1 for maximum
+# offload or a positive number for selected layers.
+gpu_layers = 0
+# Zero chooses an automatic thread count that leaves CPU capacity for the OS.
+threads = 0
+threads_batch = 0
+
+# Reduce these values first if the machine is short on RAM or VRAM.
+context_size = 2048
+batch_size = 256
+ubatch_size = 64
+parallel = 1
+cache_type_k = "q8_0"
+cache_type_v = "q8_0"
+flash_attn = "auto"
+use_mmap = true
+mlock = false
+embedding = false
+# Optional multimodal projector for a compatible multimodal GGUF.
+# mmproj_path = "/models/mmproj-model-f16.gguf"
+
+# Additional local models may be listed here. Only the default model is
+# started automatically; other models can be started from the dashboard.
