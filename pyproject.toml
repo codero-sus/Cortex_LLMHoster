@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cortex-llmhoster"
+version = "0.1.0"
+description = "A lightweight local LLM hoster for CPU and GPU with llama.cpp"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Cortex LLM Hoster contributors" }]
+dependencies = [
+  "httpx>=0.27,<1",
+  "orjson>=3.10,<4",
+  "starlette>=0.40,<1",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<2",
+]
+
+[project.scripts]
+cortex-llmhoster = "cortex_llmhoster.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cortex_llmhoster"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/cortex_llmhoster/static/index.html" = "cortex_llmhoster/static/index.html"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
