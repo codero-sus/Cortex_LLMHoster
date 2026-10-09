@@ -1,0 +1,61 @@
+CORTEX LLMHOSTER PERSONAL, NON-COMMERCIAL, NO-MODIFICATION LICENSE
+
+Copyright (c) 2026 Cortex LLMHoster project. All rights reserved.
+
+This license applies only to the original Cortex LLMHoster software and other
+materials in this repository that the copyright holder owns. Third-party
+software, Python packages, local inference runtimes, model weights, and other
+external materials are not covered by this license and remain subject to their
+respective licenses and terms.
+
+1. PERMITTED PERSONAL USE
+
+Subject to all terms below, the copyright holder grants you a limited,
+non-exclusive, non-transferable, revocable license to download, install, and run
+an unmodified copy of Cortex LLMHoster for your own personal, non-commercial
+use. This permission is provided without a license fee. Copies obtained from the
+official project repository may be retained as reasonably necessary for that
+permitted use.
+
+2. RESTRICTIONS
+
+Unless you first obtain separate written permission from the copyright holder,
+you may not:
+
+  a. modify, adapt, translate, patch, or create derivative works of Cortex
+     LLMHoster;
+  b. republish, redistribute, mirror, upload, sublicense, rent, lease, sell, or
+     otherwise make copies of Cortex LLMHoster available to another person;
+  c. use Cortex LLMHoster for Commercial Use; or
+  d. remove or alter copyright, license, or proprietary notices included with
+     Cortex LLMHoster.
+
+"Commercial Use" means use of Cortex LLMHoster to obtain or support commercial
+advantage or monetary compensation, including use as part of business
+operations, a paid product or service, consulting, or activity performed on
+behalf of a commercial organization. Personal, non-commercial use only is
+permitted under this license.
+
+3. NO OTHER RIGHTS
+
+All rights not expressly granted above are reserved. This license does not grant
+rights to any trademark, logo, or name. No rights are granted to third-party
+software or model weights; you are responsible for complying with their terms.
+
+4. TERMINATION
+
+The license terminates automatically if you fail to comply with its terms. Upon
+termination, you must stop using Cortex LLMHoster and delete copies in your
+possession or control. Sections 2, 3, and 5 survive termination.
+
+5. DISCLAIMER
+
+CORTEX LLMHOSTER IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR
+PURPOSE, AND NON-INFRINGEMENT. TO THE MAXIMUM EXTENT PERMITTED BY LAW, THE
+COPYRIGHT HOLDER IS NOT LIABLE FOR ANY CLAIM, DAMAGES, OR OTHER LIABILITY
+ARISING FROM THE SOFTWARE OR ITS USE.
+
+This custom license is a project license draft and is not legal advice. It has
+not been reviewed for any particular jurisdiction. Obtain legal review before
+relying on it for distribution or enforcement.

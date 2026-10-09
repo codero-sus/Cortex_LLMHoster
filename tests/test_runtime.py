@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from pathlib import Path
 
 import httpx
@@ -9,7 +10,9 @@ import pytest
 from cortex_llmhoster.config import ConfigurationError, ModelConfig, Settings
 from cortex_llmhoster.runtime import (
     LlamaServerManager,
+    LocalRuntimeManager,
     automatic_threads,
+    build_command_runtime_command,
     build_llama_command,
 )
 
@@ -188,4 +191,98 @@ async def test_manager_starts_and_stops_local_server(tmp_path: Path) -> None:
         stopped = await manager.stop("tiny-local")
         assert stopped["status"] == "stopped"
         assert stopped["pid"] is None
+        await manager.close()
+
+
+def test_command_runtime_templates_are_argv_and_force_loopback(tmp_path: Path) -> None:
+    model = ModelConfig(
+        id="vlm-public",
+        upstream_model="vlm-engine-name",
+        runtime="command",
+        model_path=str(tmp_path),
+        runtime_command=(
+            sys.executable,
+            "serve.py",
+            "--model",
+            "{model_path}",
+            "--served-name",
+            "{model_alias}",
+            "--host",
+            "{host}",
+            "--port",
+            "{port}",
+        ),
+    )
+
+    command = build_command_runtime_command(model, 8765)
+
+    assert command[0] == sys.executable
+    assert command[command.index("--model") + 1] == str(tmp_path.resolve())
+    assert command[command.index("--served-name") + 1] == "vlm-engine-name"
+    assert command[command.index("--host") + 1] == "127.0.0.1"
+    assert command[command.index("--port") + 1] == "8765"
+
+
+@pytest.mark.asyncio
+async def test_local_command_runtime_is_started_health_checked_and_stopped(tmp_path: Path) -> None:
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    server_script = tmp_path / "local_api.py"
+    server_script.write_text(
+        """from http.server import BaseHTTPRequestHandler, HTTPServer
+import sys
+
+args = sys.argv
+host = args[args.index('--host') + 1]
+port = int(args[args.index('--port') + 1])
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == '/health' else 404)
+        self.end_headers()
+        self.wfile.write(b'ok')
+    def log_message(self, *_args):
+        pass
+
+HTTPServer((host, port), Handler).serve_forever()
+""",
+        encoding="utf-8",
+    )
+    model = ModelConfig(
+        id="ocr-local",
+        upstream_model="ocr-engine",
+        runtime="command",
+        model_path=str(model_dir),
+        capabilities=("ocr", "vision_understanding"),
+        api_base_path="/openai/v1",
+        health_path="/health",
+        runtime_command=(
+            sys.executable,
+            str(server_script),
+            "--host",
+            "{host}",
+            "--port",
+            "{port}",
+        ),
+    )
+    settings = Settings(models={model.id: model}, default_model=model.id)
+
+    async with httpx.AsyncClient(timeout=2.0) as client:
+        manager = LocalRuntimeManager(settings, client)
+        await manager.start_configured()
+        for _ in range(60):
+            if manager.state(model.id)["status"] == "running":
+                break
+            await asyncio.sleep(0.05)
+
+        started = manager.state(model.id)
+        assert started["status"] == "running"
+        assert started["runtime"] == "command"
+        assert started["capabilities"] == ["ocr", "vision_understanding"]
+        assert started["base_url"] == f"http://127.0.0.1:{started['port']}/openai/v1"
+        assert started["command"][started["command"].index("--host") + 1] == "127.0.0.1"
+        assert (await client.get(f"http://127.0.0.1:{started['port']}/health")).status_code == 200
+
+        stopped = await manager.stop(model.id)
+        assert stopped["status"] == "stopped"
         await manager.close()

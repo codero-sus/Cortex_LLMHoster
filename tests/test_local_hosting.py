@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -117,3 +118,69 @@ async def test_local_model_is_managed_and_served_through_cortex(tmp_path, monkey
         readiness = await client.get("/ready")
         assert readiness.status_code == 503
         assert readiness.json()["reason"] == "default_local_model_not_running"
+
+
+@pytest.mark.asyncio
+async def test_command_runtime_serves_openai_compatible_modality_end_to_end(tmp_path: Path) -> None:
+    backend = tmp_path / "openai_local_backend.py"
+    backend.write_text(
+        """from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import sys
+
+args = sys.argv
+host = args[args.index('--host') + 1]
+port = int(args[args.index('--port') + 1])
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == '/health' else 404)
+        self.end_headers()
+        self.wfile.write(b'ok')
+    def do_POST(self):
+        size = int(self.headers.get('content-length', '0'))
+        payload = json.loads(self.rfile.read(size))
+        body = json.dumps({'path': self.path, 'model': payload.get('model')}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_args):
+        pass
+
+HTTPServer((host, port), Handler).serve_forever()
+""",
+        encoding="utf-8",
+    )
+    model = ModelConfig(
+        id="local-ocr",
+        upstream_model="ocr-engine-alias",
+        runtime="command",
+        capabilities=("ocr",),
+        runtime_command=(
+            str(Path(sys.executable).resolve()),
+            str(backend),
+            "--host",
+            "{host}",
+            "--port",
+            "{port}",
+        ),
+    )
+    app = create_app(Settings(models={model.id: model}, default_model=model.id))
+
+    async with open_client(app) as client:
+        for _ in range(80):
+            state = app.state.runtime_manager.state(model.id)
+            if state["status"] == "running":
+                break
+            await asyncio.sleep(0.05)
+        assert app.state.runtime_manager.state(model.id)["status"] == "running"
+
+        response = await client.post(
+            "/v1/ocr",
+            json={"image": "data:image/png;base64,aGVsbG8="},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"path": "/v1/ocr", "model": "ocr-engine-alias"}

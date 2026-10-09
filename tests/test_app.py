@@ -100,6 +100,7 @@ def make_settings(**overrides: object) -> Settings:
                 id="public-name",
                 upstream_model="runtime-model",
                 model_path="/models/test.gguf",
+                capabilities=("text_generation", "audio_transcription", "embeddings"),
             )
         },
         "default_model": "public-name",
@@ -122,6 +123,25 @@ async def open_client(app, *, fake_local_server: bool = True) -> AsyncIterator[h
             # Test the API adapter without launching a real llama-server process.
             app.state.runtime_manager.local_base_url = lambda model: "http://127.0.0.1:12345/v1"
         yield client
+
+
+@pytest.mark.asyncio
+async def test_api_routes_follow_custom_openai_api_config(tmp_path) -> None:
+    api_config = tmp_path / "api.json"
+    api_config.write_text(
+        '{"format":"openai","version":1,"base_path":"/custom/v1",'
+        '"models_path":"/available-models"}',
+        encoding="utf-8",
+    )
+    app = create_app(Settings(), api_config_path=api_config)
+
+    async with open_client(app) as client:
+        models = await client.get("/custom/v1/available-models")
+        default_route = await client.get("/v1/models")
+
+    assert models.status_code == 200
+    assert models.json() == {"object": "list", "data": []}
+    assert default_route.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -430,3 +450,205 @@ async def test_readiness_requires_a_running_local_model_without_a_default() -> N
 
     assert response.status_code == 503
     assert response.json()["reason"] == "no_local_models_running"
+
+
+@pytest.mark.asyncio
+async def test_openai_multipart_audio_form_selects_model_and_rewrites_alias() -> None:
+    observed: dict[str, object] = {}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        observed["url"] = str(request.url)
+        observed["body"] = await request.aread()
+        observed["content_type"] = request.headers.get("content-type")
+        return httpx.Response(200, json={"text": "recognized locally"})
+
+    app = create_app(make_settings(api_key=None), transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "public-name", "language": "en"},
+            files={"file": ("sample.wav", b"fake audio bytes", "audio/wav")},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "recognized locally"
+    assert str(observed["url"]).endswith("/v1/audio/transcriptions")
+    assert "multipart/form-data; boundary=" in str(observed["content_type"])
+    assert b'name="model"' in observed["body"]
+    assert b"runtime-model" in observed["body"]
+    assert b"public-name" not in observed["body"]
+    assert b"fake audio bytes" in observed["body"]
+
+
+@pytest.mark.asyncio
+async def test_multimodal_chat_checks_declared_vision_capability_and_forwards_payload() -> None:
+    observed: dict[str, object] = {}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        observed["body"] = orjson.loads(await request.aread())
+        return httpx.Response(200, json={"id": "vision-result"})
+
+    settings = Settings(
+        models={
+            "vision-public": ModelConfig(
+                id="vision-public",
+                upstream_model="vision-engine",
+                model_path="/models/vision.gguf",
+                capabilities=("text_generation", "vision_understanding"),
+            )
+        },
+        default_model="vision-public",
+    )
+    app = create_app(settings, transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "vision-public",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Read the sign."},
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": "data:image/png;base64,aGVsbG8="},
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "vision-result"
+    assert observed["body"]["model"] == "vision-engine"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_multimodal_endpoint_rejects_missing_capability_before_runtime_call() -> None:
+    calls = 0
+
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200)
+
+    settings = Settings(
+        models={
+            "text-only": ModelConfig(
+                id="text-only",
+                upstream_model="text-only",
+                model_path="/models/text.gguf",
+                capabilities=("text_generation",),
+            )
+        },
+        default_model="text-only",
+    )
+    app = create_app(settings, transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "text-only",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image_url", "image_url": {"url": "https://local.test/a.png"}}
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "unsupported_model_capability"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_media_upload_limit_is_enforced_before_backend_request() -> None:
+    calls = 0
+
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200)
+
+    app = create_app(
+        make_settings(api_key=None, max_media_body_bytes=1024),
+        transport=httpx.MockTransport(upstream),
+    )
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/audio/transcriptions",
+            data={"model": "public-name"},
+            files={"file": ("large.wav", b"x" * 2048, "audio/wav")},
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_chunked_media_upload_is_limited_without_a_content_length() -> None:
+    calls = 0
+
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200)
+
+    async def upload_chunks():
+        yield b"x" * 700
+        yield b"y" * 700
+
+    app = create_app(
+        make_settings(api_key=None, max_media_body_bytes=1024),
+        transport=httpx.MockTransport(upstream),
+    )
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/audio/transcriptions?model=public-name",
+            content=upload_chunks(),
+            headers={"content-type": "application/octet-stream"},
+        )
+
+    assert response.status_code == 413
+    assert response.json()["error"]["code"] == "request_too_large"
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_ocr_endpoint_uses_declared_task_and_injects_local_model_alias() -> None:
+    observed: dict[str, object] = {}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        observed["path"] = request.url.path
+        observed["body"] = orjson.loads(await request.aread())
+        return httpx.Response(200, json={"text": "local OCR output"})
+
+    settings = Settings(
+        models={
+            "ocr-public": ModelConfig(
+                id="ocr-public",
+                upstream_model="ocr-engine",
+                runtime="command",
+                capabilities=("ocr",),
+            )
+        },
+        default_model="ocr-public",
+    )
+    app = create_app(settings, transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/ocr",
+            json={"image": "data:image/png;base64,aGVsbG8=", "prompt": "read text"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "local OCR output"
+    assert observed["path"].endswith("/v1/ocr")
+    assert observed["body"]["model"] == "ocr-engine"  # type: ignore[index]

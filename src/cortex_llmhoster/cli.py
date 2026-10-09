@@ -6,15 +6,16 @@ import argparse
 import importlib.util
 import os
 
-from .config import ConfigurationError, Settings
+from .config import LOCAL_RUNTIMES, ConfigurationError, Settings
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="cortex-llmhoster",
-        description="Lightweight local LLM hosting with an OpenAI-compatible API.",
+        description="Local text and multimodal model hosting with an OpenAI-compatible API.",
     )
     parser.add_argument("--config", help="TOML config file (default: ./cortex.toml)")
+    parser.add_argument("--api-config", help="OpenAI-compatible API route config JSON.")
     parser.add_argument("--host", help="Listen address (overrides TOML/environment).")
     parser.add_argument("--port", type=int, help="Listen port (overrides TOML/environment).")
     parser.add_argument(
@@ -45,6 +46,8 @@ def main() -> None:
 
     if args.config:
         os.environ["CORTEX_CONFIG"] = args.config
+    if args.api_config:
+        os.environ["CORTEX_API_CONFIG"] = args.api_config
 
     try:
         settings = Settings.load()
@@ -58,10 +61,10 @@ def main() -> None:
         parser.error("--port must be between 1 and 65535.")
     if workers < 1:
         parser.error("--workers must be at least 1.")
-    if workers > 1 and any(model.runtime == "llama.cpp" for model in settings.models.values()):
+    if workers > 1 and any(model.runtime in LOCAL_RUNTIMES for model in settings.models.values()):
         parser.error(
-            "Local llama.cpp models require --workers 1 so model weights are not loaded once "
-            "per worker. Use the model's parallel setting for concurrent requests."
+            "Locally managed model runtimes require --workers 1 so model weights are not "
+            "loaded once per worker. Use the runtime's own concurrency settings."
         )
 
     # Prefer uvloop + httptools where the platform provides them, while retaining

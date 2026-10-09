@@ -1,0 +1,6 @@
+{
+  "format": "openai",
+  "version": 1,
+  "base_path": "/v1",
+  "models_path": "/models"
+}

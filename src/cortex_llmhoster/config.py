@@ -1,19 +1,75 @@
-"""Configuration loading and validation for the Cortex local LLM hoster."""
+"""Configuration loading and validation for the Cortex local model hoster."""
 
 from __future__ import annotations
 
 import json
 import math
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from string import Formatter
 from types import MappingProxyType
 
 
 class ConfigurationError(ValueError):
     """Raised when a Cortex configuration is invalid."""
+
+
+LOCAL_RUNTIMES = frozenset({"llama.cpp", "command"})
+DEFAULT_CAPABILITIES = ("text_generation",)
+_COMMAND_PLACEHOLDERS = frozenset(
+    {
+        "model_path",
+        "model_id",
+        "model_alias",
+        "host",
+        "port",
+        "api_base_path",
+        "health_path",
+        "gpu_layers",
+        "threads",
+        "context_size",
+    }
+)
+
+
+def _capability_name(value: str) -> str:
+    """Normalize task labels while preserving user-defined future capabilities."""
+
+    return value.strip().lower().replace("-", "_")
+
+
+def _validate_runtime_command(command: list[str] | tuple[str, ...], prefix: str) -> set[str]:
+    placeholders: set[str] = set()
+    formatter = Formatter()
+    for index, argument in enumerate(command):
+        if not argument:
+            raise ConfigurationError(f"{prefix}.runtime_command[{index}] must not be empty.")
+        try:
+            for _, field_name, format_spec, conversion in formatter.parse(argument):
+                if field_name is None:
+                    continue
+                if field_name not in _COMMAND_PLACEHOLDERS:
+                    raise ConfigurationError(
+                        f"{prefix}.runtime_command uses unsupported placeholder {{{field_name}}}."
+                    )
+                if format_spec or conversion:
+                    raise ConfigurationError(
+                        f"{prefix}.runtime_command placeholders cannot use format specifiers."
+                    )
+                placeholders.add(field_name)
+        except ValueError as exc:
+            raise ConfigurationError(f"{prefix}.runtime_command has invalid braces: {exc}") from exc
+    missing = {"host", "port"} - placeholders
+    if missing:
+        raise ConfigurationError(
+            f"{prefix}.runtime_command must include {{{', '.join(sorted(missing))}}} "
+            "placeholders so the runtime binds to Cortex's loopback port."
+        )
+    return placeholders
 
 
 def resolve_admin_config_path(
@@ -32,12 +88,16 @@ def resolve_admin_config_path(
 
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
-    """A local GGUF model and its llama.cpp serving configuration."""
+    """A local model, its task capabilities, and its local runtime adapter."""
 
     id: str
     upstream_model: str
     runtime: str = "llama.cpp"
     model_path: str | None = None
+    capabilities: tuple[str, ...] = DEFAULT_CAPABILITIES
+    runtime_command: tuple[str, ...] = ()
+    api_base_path: str = "/v1"
+    health_path: str = "/health"
     threads: int = 0
     threads_batch: int = 0
     gpu_layers: int = 0
@@ -54,6 +114,20 @@ class ModelConfig:
     mmproj_path: str | None = None
     optimization_level: int = 0
 
+    @property
+    def effective_capabilities(self) -> tuple[str, ...]:
+        """Return declared tasks plus capabilities implied by legacy llama flags."""
+
+        capabilities = list(self.capabilities)
+        if self.embedding and "embeddings" not in capabilities:
+            capabilities.append("embeddings")
+        if self.mmproj_path and "vision_understanding" not in capabilities:
+            capabilities.append("vision_understanding")
+        return tuple(capabilities)
+
+    def supports(self, capability: str) -> bool:
+        return capability in self.effective_capabilities
+
 
 @dataclass(frozen=True, slots=True)
 class Settings:
@@ -63,13 +137,14 @@ class Settings:
     default_model: str | None = None
     api_key: str | None = None
     api_key_env: str = "CORTEX_API_KEY"
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8624
     workers: int = 1
     log_level: str = "warning"
     access_log: bool = False
     llama_server_path: str | None = None
     max_json_body_bytes: int = 16 * 1024 * 1024
+    max_media_body_bytes: int = 2 * 1024 * 1024 * 1024
     max_inference_requests: int = 8
     connect_timeout: float = 5.0
     read_timeout: float = 300.0
@@ -170,9 +245,15 @@ class Settings:
                 raise ConfigurationError(f"Duplicate model id: {model_id!r}.")
 
             runtime = row.get("runtime", "llama.cpp")
-            if runtime != "llama.cpp":
+            if not isinstance(runtime, str) or runtime not in LOCAL_RUNTIMES:
+                supported = ", ".join(sorted(LOCAL_RUNTIMES))
                 raise ConfigurationError(
-                    f"{prefix}.runtime must be 'llama.cpp'; Cortex hosts local GGUF models only."
+                    f"{prefix}.runtime must be one of: {supported}. "
+                    "Use 'command' for a locally managed OpenAI-compatible runtime."
+                )
+            if "base_url" in row:
+                raise ConfigurationError(
+                    f"{prefix}.base_url is not supported; inference backends must be local processes."
                 )
             raw_optimization_level = row.get("optimization_level")
             if raw_optimization_level is None:
@@ -201,14 +282,80 @@ class Settings:
                 raise ConfigurationError(f"{prefix}.optimization_level must be -1, 0, or 1.")
 
             model_path = row.get("model_path")
-            if not isinstance(model_path, str) or not model_path.strip():
-                raise ConfigurationError(f"{prefix}.model_path is required for local GGUF models.")
-            if Path(model_path).suffix.lower() != ".gguf":
-                raise ConfigurationError(f"{prefix}.model_path must point to a GGUF file.")
+            if model_path is not None and (
+                not isinstance(model_path, str) or not model_path.strip()
+            ):
+                raise ConfigurationError(f"{prefix}.model_path must be a non-empty path string.")
+            if runtime == "llama.cpp":
+                if model_path is None:
+                    raise ConfigurationError(
+                        f"{prefix}.model_path is required for local llama.cpp models."
+                    )
+                if Path(model_path).suffix.lower() != ".gguf":
+                    raise ConfigurationError(f"{prefix}.model_path must point to a GGUF file.")
 
             upstream_model = row.get("upstream_model", model_id)
             if not isinstance(upstream_model, str) or not upstream_model.strip():
                 raise ConfigurationError(f"{prefix}.upstream_model must be a non-empty string.")
+
+            raw_capabilities = row.get("capabilities", DEFAULT_CAPABILITIES)
+            if not isinstance(raw_capabilities, (list, tuple)) or any(
+                not isinstance(capability, str) for capability in raw_capabilities
+            ):
+                raise ConfigurationError(f"{prefix}.capabilities must be an array of strings.")
+            capabilities: list[str] = []
+            for capability in raw_capabilities:
+                normalized = _capability_name(capability)
+                if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", normalized):
+                    raise ConfigurationError(
+                        f"{prefix}.capabilities entries must be task names using letters, "
+                        "digits, hyphens, or underscores."
+                    )
+                if normalized not in capabilities:
+                    capabilities.append(normalized)
+
+            raw_command = row.get("runtime_command", [])
+            if not isinstance(raw_command, (list, tuple)) or any(
+                not isinstance(argument, str) for argument in raw_command
+            ):
+                raise ConfigurationError(f"{prefix}.runtime_command must be an array of strings.")
+            runtime_command = tuple(raw_command)
+            if runtime == "command":
+                if not runtime_command:
+                    raise ConfigurationError(
+                        f"{prefix}.runtime_command is required for the command runtime."
+                    )
+                placeholders = _validate_runtime_command(runtime_command, prefix)
+                if "model_path" in placeholders and model_path is None:
+                    raise ConfigurationError(
+                        f"{prefix}.model_path is required by its runtime_command."
+                    )
+            elif runtime_command:
+                raise ConfigurationError(
+                    f"{prefix}.runtime_command is only used by the command runtime."
+                )
+
+            def configured_path(
+                name: str,
+                default: str,
+                *,
+                allow_empty: bool = False,
+                row: Mapping[str, object] = row,
+                prefix: str = prefix,
+            ) -> str:
+                value = row.get(name, default)
+                if not isinstance(value, str) or (not value and not allow_empty):
+                    raise ConfigurationError(f"{prefix}.{name} must be an absolute URL path.")
+                if value and not value.startswith("/"):
+                    raise ConfigurationError(f"{prefix}.{name} must start with '/'.")
+                if any(token in value for token in ("?", "#", "\\")):
+                    raise ConfigurationError(f"{prefix}.{name} must be a URL path only.")
+                if any(segment in {".", ".."} for segment in value.split("/")):
+                    raise ConfigurationError(f"{prefix}.{name} cannot contain dot segments.")
+                return value.rstrip("/") if value not in {"", "/"} else ""
+
+            api_base_path = configured_path("api_base_path", "/v1", allow_empty=True)
+            health_path = configured_path("health_path", "/health")
 
             def model_int(
                 name: str,
@@ -262,6 +409,18 @@ class Settings:
                 )
             if mmproj_path is not None and not isinstance(mmproj_path, str):
                 raise ConfigurationError(f"{prefix}.mmproj_path must be a path string.")
+            if mmproj_path == "":
+                mmproj_path = None
+            if embedding and "embeddings" not in capabilities:
+                capabilities.append("embeddings")
+            if (
+                runtime == "llama.cpp"
+                and mmproj_path
+                and "vision_understanding" not in capabilities
+            ):
+                capabilities.append("vision_understanding")
+            if runtime == "llama.cpp" and "embeddings" in capabilities:
+                embedding = True
 
             models[model_id] = ModelConfig(
                 id=model_id,
@@ -269,6 +428,10 @@ class Settings:
                 runtime=runtime,
                 optimization_level=optimization_level,
                 model_path=model_path,
+                capabilities=tuple(capabilities),
+                runtime_command=runtime_command,
+                api_base_path=api_base_path,
+                health_path=health_path,
                 threads=threads,
                 threads_batch=threads_batch,
                 gpu_layers=gpu_layers,
@@ -328,7 +491,7 @@ class Settings:
                 raise ConfigurationError(f"{env_name} / server.{name} is invalid.") from exc
             return converted
 
-        host = env.get("CORTEX_HOST", server.get("host", "0.0.0.0"))
+        host = env.get("CORTEX_HOST", server.get("host", "127.0.0.1"))
         if not isinstance(host, str) or not host:
             raise ConfigurationError("CORTEX_HOST / server.host must be a non-empty string.")
         port = setting("port", "CORTEX_PORT", 8624, int)
@@ -337,10 +500,10 @@ class Settings:
             raise ConfigurationError("port must be between 1 and 65535.")
         if workers < 1:
             raise ConfigurationError("workers must be at least 1.")
-        if workers > 1 and any(model.runtime == "llama.cpp" for model in models.values()):
+        if workers > 1 and any(model.runtime in LOCAL_RUNTIMES for model in models.values()):
             raise ConfigurationError(
-                "Local llama.cpp models require one Cortex worker so model weights are not "
-                "loaded once per worker; use llama-server parallelism for concurrent requests."
+                "Locally managed model runtimes require one Cortex worker so model weights are "
+                "not loaded once per worker; use the runtime's own parallelism for concurrency."
             )
 
         log_level = env.get("CORTEX_LOG_LEVEL", server.get("log_level", "warning"))
@@ -408,6 +571,14 @@ class Settings:
         )
         if max_json_body_bytes < 1024:
             raise ConfigurationError("max_json_body_bytes must be at least 1024.")
+        max_media_body_bytes = setting(
+            "max_media_body_bytes",
+            "CORTEX_MAX_MEDIA_BODY_BYTES",
+            2 * 1024 * 1024 * 1024,
+            int,
+        )
+        if max_media_body_bytes < 1024:
+            raise ConfigurationError("max_media_body_bytes must be at least 1024.")
 
         timeouts = {
             "connect_timeout": setting("connect_timeout", "CORTEX_CONNECT_TIMEOUT", 5.0, float),
@@ -431,6 +602,7 @@ class Settings:
             access_log=access_log,
             llama_server_path=llama_server_path,
             max_json_body_bytes=max_json_body_bytes,
+            max_media_body_bytes=max_media_body_bytes,
             max_inference_requests=max_inference_requests,
             max_connections=max_connections,
             max_keepalive_connections=max_keepalive_connections,

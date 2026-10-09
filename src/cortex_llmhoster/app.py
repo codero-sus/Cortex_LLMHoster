@@ -1,4 +1,4 @@
-"""Local model hosting API with streamed OpenAI-compatible inference routes."""
+"""Local text/multimodal model hosting with streamed OpenAI-compatible routes."""
 
 from __future__ import annotations
 
@@ -16,11 +16,13 @@ from urllib.parse import parse_qsl, quote, urlencode
 import httpx
 import orjson
 from starlette.applications import Starlette
+from starlette.datastructures import UploadFile
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
+from .api_config import APIFormatConfig
 from .config import ConfigurationError, ModelConfig, Settings, resolve_admin_config_path
 from .dashboard import (
     InferenceMetrics,
@@ -40,7 +42,7 @@ from .dashboard import (
 )
 from .responses import OrjsonResponse
 from .responses import error_response as _error
-from .runtime import LlamaServerManager, automatic_threads, detect_hardware
+from .runtime import LocalRuntimeManager, automatic_threads, detect_hardware
 
 logger = logging.getLogger("cortex_llmhoster.server")
 
@@ -158,16 +160,107 @@ def _local_model_url(request: Request, model: ModelConfig, base_url: str) -> str
 _MODEL_BODY_ENDPOINTS = frozenset(
     {
         "audio/speech",
+        "audio/transcriptions",
+        "audio/translations",
         "chat/completions",
         "completions",
         "embeddings",
         "fine_tuning/jobs",
+        "images/edits",
         "images/generations",
+        "images/variations",
         "moderations",
+        "ocr",
+        "ocr/parse",
         "responses",
         "rerank",
+        "audio/analysis",
+        "video/analysis",
+        "video/generations",
+        "video/understanding",
+        "videos/analysis",
+        "videos/generations",
+        "videos/understanding",
     }
 )
+
+_ENDPOINT_CAPABILITIES = {
+    "audio/speech": "audio_generation",
+    "audio/transcriptions": "audio_transcription",
+    "audio/translations": "audio_transcription",
+    "embeddings": "embeddings",
+    "images/edits": "image_generation",
+    "images/generations": "image_generation",
+    "images/variations": "image_generation",
+    "moderations": "moderation",
+    "rerank": "reranking",
+    "video/generations": "video_generation",
+    "videos/generations": "video_generation",
+    "videos/understanding": "video_understanding",
+    "video/understanding": "video_understanding",
+    "video/analysis": "video_understanding",
+    "videos/analysis": "video_understanding",
+    "ocr": "ocr",
+    "ocr/parse": "ocr",
+    "audio/analysis": "audio_understanding",
+}
+
+
+def _message_capabilities(value: object) -> set[str]:
+    """Infer common input/output modalities from OpenAI-style JSON payloads."""
+
+    found: set[str] = set()
+    if isinstance(value, dict):
+        media_type = value.get("type")
+        if isinstance(media_type, str):
+            normalized_type = media_type.lower().replace("-", "_")
+            if normalized_type in {"image", "image_url", "input_image"}:
+                found.add("vision_understanding")
+            elif normalized_type in {"input_audio", "audio_url", "input_audio_buffer"}:
+                found.add("audio_understanding")
+            elif normalized_type in {"video", "video_url", "input_video"}:
+                found.add("video_understanding")
+        for key, nested in value.items():
+            normalized_key = str(key).lower().replace("-", "_")
+            if normalized_key in {"image", "image_url", "images", "input_image"}:
+                found.add("vision_understanding")
+            elif normalized_key in {"input_audio", "audio_url", "audio_input"}:
+                found.add("audio_understanding")
+            elif normalized_key in {"video", "video_url", "videos", "input_video"}:
+                found.add("video_understanding")
+            elif (
+                normalized_key == "modalities"
+                and isinstance(nested, list)
+                and any(str(item).lower() == "audio" for item in nested)
+            ):
+                found.add("audio_generation")
+            found.update(_message_capabilities(nested))
+    elif isinstance(value, list):
+        for item in value:
+            found.update(_message_capabilities(item))
+    elif isinstance(value, str):
+        lowered = value.lower()
+        if lowered.startswith("data:image/"):
+            found.add("vision_understanding")
+        elif lowered.startswith("data:audio/"):
+            found.add("audio_understanding")
+        elif any(extension in lowered for extension in (".mp4", ".mov", ".webm", ".mkv")):
+            found.add("video_understanding")
+    return found
+
+
+def _required_capabilities(route_path: str, body: dict[str, object] | None) -> set[str]:
+    normalized_path = route_path.strip("/").lower()
+    required = _ENDPOINT_CAPABILITIES.get(normalized_path)
+    if required is not None:
+        return {required}
+    if normalized_path in {"chat/completions", "completions", "responses"}:
+        detected = _message_capabilities(body or {})
+        return detected or {"text_generation"}
+    if normalized_path.startswith("ocr/"):
+        return {"ocr"}
+    return set()
+
 
 _FORWARD_REQUEST_HEADERS = (
     "accept",
@@ -255,6 +348,88 @@ async def _read_limited_json_body(
     return bytes(body), None
 
 
+class _MediaBodyTooLarge(Exception):
+    """Signal that a streamed media upload exceeded the configured limit."""
+
+
+def _media_size_error(limit: int) -> Response:
+    return _error(
+        f"Media request body exceeds the {limit}-byte limit.",
+        status_code=413,
+        code="request_too_large",
+    )
+
+
+async def _limited_media_stream(request: Request, limit: int):
+    """Stream a raw media body with a byte ceiling; do not buffer it in memory."""
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            return None, _error("Invalid Content-Length header.", status_code=400)
+        if declared_length < 0:
+            return None, _error("Invalid Content-Length header.", status_code=400)
+        if declared_length > limit:
+            return None, _media_size_error(limit)
+
+    async def stream():
+        received = 0
+        async for chunk in request.stream():
+            received += len(chunk)
+            if received > limit:
+                raise _MediaBodyTooLarge
+            yield chunk
+
+    return stream(), None
+
+
+async def _read_limited_multipart_form(request: Request, limit: int):
+    """Parse a bounded multipart form, spooling media files instead of buffering RAM."""
+
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError:
+            return None, _error("Invalid Content-Length header.", status_code=400)
+        if declared_length < 0:
+            return None, _error("Invalid Content-Length header.", status_code=400)
+        if declared_length > limit:
+            return None, _error(
+                f"Media request body exceeds the {limit}-byte limit.",
+                status_code=413,
+                code="request_too_large",
+            )
+
+    received = 0
+    original_receive = request.receive
+
+    async def limited_receive():
+        nonlocal received
+        message = await original_receive()
+        if message.get("type") == "http.request":
+            received += len(message.get("body", b""))
+            if received > limit:
+                raise _MediaBodyTooLarge
+        return message
+
+    parsing_request = Request(request.scope, receive=limited_receive)
+    try:
+        form = await parsing_request.form(max_files=16, max_fields=100, max_part_size=1024 * 1024)
+    except _MediaBodyTooLarge:
+        return None, _error(
+            f"Media request body exceeds the {limit}-byte limit.",
+            status_code=413,
+            code="request_too_large",
+        )
+    except Exception as exc:  # noqa: BLE001 - malformed multipart should be a 400
+        logger.debug("Could not parse multipart media request: %s", exc)
+        return None, _error("Request body is not valid multipart form data.", status_code=400)
+    return form, None
+
+
 async def health(_: Request) -> Response:
     """Liveness endpoint; it does not make a slow downstream health check."""
 
@@ -308,6 +483,8 @@ async def list_models(request: Request) -> Response:
                     "object": "model",
                     "created": created,
                     "owned_by": "cortex-llmhoster",
+                    "runtime": model.runtime,
+                    "capabilities": list(model.effective_capabilities),
                 }
                 for model in settings.models.values()
             ],
@@ -323,143 +500,223 @@ async def inference(request: Request) -> Response:
 
     json_body: dict[str, object] | None = None
     body: bytes | None = None
+    multipart_form = None
+    multipart_items: list[tuple[str, object]] = []
+    request_content = None
     content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     is_json = content_type == "application/json" or content_type.endswith("+json")
+    is_multipart = content_type == "multipart/form-data"
 
-    if is_json:
-        body, body_error = await _read_limited_json_body(request, settings.max_json_body_bytes)
-        if body_error is not None:
-            return body_error
-        assert body is not None
-        if body:
-            try:
-                parsed_body = orjson.loads(body)
-            except orjson.JSONDecodeError:
-                return _error("Request body is not valid JSON.", status_code=400)
-            if isinstance(parsed_body, dict):
-                json_body = parsed_body
-
-    body_model: object = json_body.get("model") if json_body is not None else None
-    requested_model = body_model
-    if requested_model is None:
-        requested_model = request.query_params.get("model")
-    model, model_error = _select_model(settings, requested_model)
-    if model_error is not None:
-        return model_error
-    assert model is not None
-
-    # Rewrite explicit model aliases on any JSON route. Inject the default only
-    # on standard inference endpoints; unrelated /v1 resources (e.g. assistants)
-    # must remain byte-for-byte transparent.
-    route_path = request.path_params.get("path", "").strip("/")
-    should_inject_model = route_path in _MODEL_BODY_ENDPOINTS and body_model is None
-    should_rewrite_model = body_model is not None and body_model != model.upstream_model
-    if json_body is not None and (should_inject_model or should_rewrite_model):
-        rewritten = dict(json_body)
-        rewritten["model"] = model.upstream_model
-        body = orjson.dumps(rewritten)
-
-    base_url = request.app.state.runtime_manager.local_base_url(model)
-    if base_url is None:
-        runtime_state = request.app.state.runtime_manager.state(model.id)
-        detail = runtime_state.get("error") or (
-            "Start this local model from the Cortex dashboard and wait until it is ready."
-        )
-        return _error(
-            detail,
-            status_code=503,
-            error_type="server_error",
-            code="local_model_not_ready",
-        )
     try:
-        target_url = _local_model_url(request, model, base_url)
-    except ValueError:
-        return _error("Invalid API path.", status_code=400)
+        if is_json:
+            body, body_error = await _read_limited_json_body(request, settings.max_json_body_bytes)
+            if body_error is not None:
+                return body_error
+            assert body is not None
+            if body:
+                try:
+                    parsed_body = orjson.loads(body)
+                except orjson.JSONDecodeError:
+                    return _error("Request body is not valid JSON.", status_code=400)
+                if isinstance(parsed_body, dict):
+                    json_body = parsed_body
+        elif is_multipart and request.query_params.get("model") is None:
+            multipart_form, body_error = await _read_limited_multipart_form(
+                request, settings.max_media_body_bytes
+            )
+            if body_error is not None:
+                return body_error
+            multipart_items = list(multipart_form.multi_items())
 
-    outgoing_headers = {
-        name: request.headers[name] for name in _FORWARD_REQUEST_HEADERS if name in request.headers
-    }
+        body_model: object = json_body.get("model") if json_body is not None else None
+        if body_model is None and multipart_form is not None:
+            body_model = next(
+                (
+                    value
+                    for key, value in multipart_items
+                    if key == "model" and isinstance(value, str)
+                ),
+                None,
+            )
+        requested_model = body_model
+        if requested_model is None:
+            requested_model = request.query_params.get("model")
+        model, model_error = _select_model(settings, requested_model)
+        if model_error is not None:
+            return model_error
+        assert model is not None
 
-    # JSON payloads are small and already buffered for model selection. For other
-    # content types (notably multipart audio/image uploads), stream directly from
-    # the client to the inference server to avoid a second in-memory copy.
-    request_content = body if body is not None else request.stream()
-    client: httpx.AsyncClient = request.app.state.http_client
-    metrics: InferenceMetrics = request.app.state.metrics
-    metrics_started_at = metrics.start(model.id)
-    try:
-        upstream_request = client.build_request(
-            request.method,
-            target_url,
-            headers=outgoing_headers,
-            content=request_content,
-            timeout=_request_timeout(
-                settings.connect_timeout,
-                settings.read_timeout,
-                settings.write_timeout,
-                settings.pool_timeout,
-            ),
-        )
-        upstream_response = await client.send(upstream_request, stream=True)
-    except asyncio.CancelledError:
-        metrics.finish(metrics_started_at, 499)
-        raise
-    except httpx.PoolTimeout:
-        metrics.finish(metrics_started_at, 503)
-        return _error(
-            "Cortex is at capacity; retry the request shortly.",
-            status_code=503,
-            error_type="server_error",
-            code="server_capacity_exceeded",
-        )
-    except httpx.TimeoutException:
-        metrics.finish(metrics_started_at, 504)
-        return _model_timeout()
-    except httpx.RequestError:
-        metrics.finish(metrics_started_at, 502)
-        logger.warning("Could not reach local llama-server for model %s", model.id)
-        return _local_model_unavailable()
+        route_path = request.path_params.get("path", "").strip("/")
+        required_capabilities = _required_capabilities(route_path, json_body)
+        missing_capabilities = required_capabilities - set(model.effective_capabilities)
+        if missing_capabilities:
+            missing = ", ".join(sorted(missing_capabilities))
+            available = ", ".join(model.effective_capabilities) or "none declared"
+            return _error(
+                f"Model {model.id!r} does not declare required capability: {missing}. "
+                f"Available capabilities: {available}.",
+                status_code=422,
+                error_type="invalid_request_error",
+                code="unsupported_model_capability",
+                param="model",
+            )
 
-    async def relay():
-        final_status = upstream_response.status_code
+        should_inject_model = route_path in _MODEL_BODY_ENDPOINTS and body_model is None
+        should_rewrite_model = body_model is not None and body_model != model.upstream_model
+        if json_body is not None and (should_inject_model or should_rewrite_model):
+            rewritten = dict(json_body)
+            rewritten["model"] = model.upstream_model
+            body = orjson.dumps(rewritten)
+
+        if multipart_form is None and body is None:
+            request_content, body_error = await _limited_media_stream(
+                request, settings.max_media_body_bytes
+            )
+            if body_error is not None:
+                return body_error
+
+        base_url = request.app.state.runtime_manager.local_base_url(model)
+        if base_url is None:
+            runtime_state = request.app.state.runtime_manager.state(model.id)
+            detail = runtime_state.get("error") or (
+                "Start this local model from the Cortex dashboard and wait until it is ready."
+            )
+            return _error(
+                detail,
+                status_code=503,
+                error_type="server_error",
+                code="local_model_not_ready",
+            )
         try:
-            # Mock/custom transports may return an eagerly-buffered response even
-            # though the production client requested a streamed response.
-            if upstream_response.is_stream_consumed:
-                if upstream_response.content:
-                    yield upstream_response.content
+            target_url = _local_model_url(request, model, base_url)
+        except ValueError:
+            return _error("Invalid API path.", status_code=400)
+
+        outgoing_headers = {
+            name: request.headers[name]
+            for name in _FORWARD_REQUEST_HEADERS
+            if name in request.headers
+            and not (multipart_form is not None and name == "content-type")
+        }
+        client: httpx.AsyncClient = request.app.state.http_client
+        metrics: InferenceMetrics = request.app.state.metrics
+        metrics_started_at = metrics.start(model.id)
+        try:
+            request_kwargs: dict[str, object]
+            if multipart_form is not None:
+                form_fields: dict[str, str | list[str]] = {}
+                form_files: list[tuple[str, tuple[object, ...]]] = []
+                found_model = False
+                for key, value in multipart_items:
+                    if isinstance(value, UploadFile):
+                        form_files.append(
+                            (
+                                key,
+                                (
+                                    value.filename or "upload.bin",
+                                    value.file,
+                                    value.content_type or "application/octet-stream",
+                                ),
+                            )
+                        )
+                    else:
+                        text_value = str(value)
+                        if key == "model":
+                            found_model = True
+                            if should_inject_model or should_rewrite_model:
+                                text_value = model.upstream_model
+                        if key not in form_fields:
+                            form_fields[key] = text_value
+                        else:
+                            previous = form_fields[key]
+                            if isinstance(previous, list):
+                                previous.append(text_value)
+                            else:
+                                form_fields[key] = [previous, text_value]
+                if should_inject_model and not found_model:
+                    form_fields["model"] = model.upstream_model
+                request_kwargs = {"data": form_fields, "files": form_files}
             else:
-                async for chunk in upstream_response.aiter_raw():
-                    if chunk:
-                        yield chunk
+                request_kwargs = {"content": body if body is not None else request_content}
+
+            upstream_request = client.build_request(
+                request.method,
+                target_url,
+                headers=outgoing_headers,
+                timeout=_request_timeout(
+                    settings.connect_timeout,
+                    settings.read_timeout,
+                    settings.write_timeout,
+                    settings.pool_timeout,
+                ),
+                **request_kwargs,
+            )
+            upstream_response = await client.send(upstream_request, stream=True)
         except asyncio.CancelledError:
-            final_status = 499
+            metrics.finish(metrics_started_at, 499)
             raise
-        except httpx.HTTPError:
-            final_status = 502
-            logger.warning("llama-server stream failed for model %s", model.id)
-            raise
-        finally:
+        except _MediaBodyTooLarge:
+            metrics.finish(metrics_started_at, 413)
+            return _media_size_error(settings.max_media_body_bytes)
+        except httpx.PoolTimeout:
+            metrics.finish(metrics_started_at, 503)
+            return _error(
+                "Cortex is at capacity; retry the request shortly.",
+                status_code=503,
+                error_type="server_error",
+                code="server_capacity_exceeded",
+            )
+        except httpx.TimeoutException:
+            metrics.finish(metrics_started_at, 504)
+            return _model_timeout()
+        except httpx.RequestError:
+            metrics.finish(metrics_started_at, 502)
+            logger.warning("Could not reach local runtime for model %s", model.id)
+            return _local_model_unavailable()
+
+        async def relay():
+            final_status = upstream_response.status_code
             try:
-                await upstream_response.aclose()
+                # Mock/custom transports may return an eagerly-buffered response even
+                # though the production client requested a streamed response.
+                if upstream_response.is_stream_consumed:
+                    if upstream_response.content:
+                        yield upstream_response.content
+                else:
+                    async for chunk in upstream_response.aiter_raw():
+                        if chunk:
+                            yield chunk
+            except asyncio.CancelledError:
+                final_status = 499
+                raise
+            except httpx.HTTPError:
+                final_status = 502
+                logger.warning("Local runtime stream failed for model %s", model.id)
+                raise
             finally:
-                metrics.finish(metrics_started_at, final_status)
+                try:
+                    await upstream_response.aclose()
+                finally:
+                    metrics.finish(metrics_started_at, final_status)
 
-    headers = _response_headers(upstream_response)
-    if "text/event-stream" in upstream_response.headers.get("content-type", "").lower():
-        headers.setdefault("cache-control", "no-cache")
-        headers["x-accel-buffering"] = "no"
+        headers = _response_headers(upstream_response)
+        if "text/event-stream" in upstream_response.headers.get("content-type", "").lower():
+            headers.setdefault("cache-control", "no-cache")
+            headers["x-accel-buffering"] = "no"
 
-    if request.method == "HEAD":
-        await upstream_response.aclose()
-        metrics.finish(metrics_started_at, upstream_response.status_code)
-        return Response(status_code=upstream_response.status_code, headers=headers)
+        if request.method == "HEAD":
+            await upstream_response.aclose()
+            metrics.finish(metrics_started_at, upstream_response.status_code)
+            return Response(status_code=upstream_response.status_code, headers=headers)
 
-    return StreamingResponse(
-        relay(),
-        status_code=upstream_response.status_code,
-        headers=headers,
-    )
+        return StreamingResponse(
+            relay(),
+            status_code=upstream_response.status_code,
+            headers=headers,
+        )
+    finally:
+        if multipart_form is not None:
+            await multipart_form.close()
 
 
 class InferenceRequestLimiter:
@@ -493,16 +750,26 @@ class InferenceRequestLimiter:
 class InferenceCapacityMiddleware:
     """Bound active inference work before the route consumes request bodies."""
 
-    def __init__(self, app, limiter: InferenceRequestLimiter) -> None:
+    def __init__(
+        self,
+        app,
+        limiter: InferenceRequestLimiter,
+        api_base_path: str,
+        models_endpoint: str,
+    ) -> None:
         self.app = app
         self._limiter = limiter
+        normalized_base = api_base_path.rstrip("/")
+        self._api_prefix = f"{normalized_base}/" if normalized_base else "/"
+        self._models_endpoint = models_endpoint
 
     async def __call__(self, scope, receive, send) -> None:
         path = scope.get("path", "")
+        in_api = path.startswith(self._api_prefix)
         if (
             scope.get("type") != "http"
-            or not path.startswith("/v1/")
-            or (path == "/v1/models" and scope.get("method") == "GET")
+            or not in_api
+            or (path == self._models_endpoint and scope.get("method") == "GET")
         ):
             await self.app(scope, receive, send)
             return
@@ -532,11 +799,13 @@ def create_app(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
     admin_config_path: str | Path | None = None,
+    api_config_path: str | Path | None = None,
 ) -> Starlette:
     """Build an ASGI app. ``transport`` is injectable for tests and adapters."""
 
     watch_config_files = settings is None
     runtime_settings = settings if settings is not None else Settings.load()
+    api_format = APIFormatConfig.load(api_config_path)
 
     @asynccontextmanager
     async def lifespan(app: Starlette):
@@ -559,7 +828,7 @@ def create_app(
             trust_env=False,
         )
         app.state.models_created_at = int(time())
-        runtime_manager = LlamaServerManager(
+        runtime_manager = LocalRuntimeManager(
             app.state.settings,
             app.state.http_client,
             hardware=_initial_hardware_snapshot(),
@@ -645,9 +914,9 @@ def create_app(
         Route("/admin/api/models/restart", restart_model, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/ready", readiness, methods=["GET"]),
-        Route("/v1/models", list_models, methods=["GET"]),
+        Route(f"{api_format.models_endpoint}", list_models, methods=["GET"]),
         Route(
-            "/v1/{path:path}",
+            f"{api_format.base_path}/{{path:path}}",
             inference,
             methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
         ),
@@ -656,7 +925,14 @@ def create_app(
     app = Starlette(
         routes=routes,
         lifespan=lifespan,
-        middleware=[Middleware(InferenceCapacityMiddleware, limiter=inference_limiter)],
+        middleware=[
+            Middleware(
+                InferenceCapacityMiddleware,
+                limiter=inference_limiter,
+                api_base_path=api_format.base_path,
+                models_endpoint=api_format.models_endpoint,
+            )
+        ],
     )
     app.state.inference_limiter = inference_limiter
     app.state.settings = runtime_settings
@@ -665,6 +941,7 @@ def create_app(
     app.state.admin_config_path = (
         Path(admin_config_path) if admin_config_path is not None else resolve_admin_config_path()
     )
+    app.state.api_format = api_format
     return app
 
 

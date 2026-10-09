@@ -1,0 +1,30 @@
+{
+  "format": "openai",
+  "version": 1,
+  "base_path": "/v1",
+  "models_path": "/models",
+  "examples": {
+    "list_models": {
+      "method": "GET",
+      "path": "/v1/models"
+    },
+    "chat_completions": {
+      "method": "POST",
+      "path": "/v1/chat/completions",
+      "headers": {
+        "Authorization": "Bearer $CORTEX_API_KEY",
+        "Content-Type": "application/json"
+      },
+      "body": {
+        "model": "your-local-model",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello!"
+          }
+        ],
+        "stream": true
+      }
+    }
+  }
+}

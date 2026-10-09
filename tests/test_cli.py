@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import sys
 
 import uvicorn
@@ -54,3 +55,21 @@ def test_cli_uses_default_port_8624(monkeypatch) -> None:
     cli.main()
 
     assert observed["port"] == 8624
+
+
+def test_cli_accepts_api_config_override(monkeypatch) -> None:
+    observed: dict[str, object] = {}
+    api_config = "/tmp/cortex-api.json"
+    previous_api_config = os.environ.pop("CORTEX_API_CONFIG", None)
+    monkeypatch.setattr(cli.Settings, "load", lambda: Settings())
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: observed.update(kwargs))
+    monkeypatch.setattr(sys, "argv", ["cortex-llmhoster", "--api-config", api_config])
+
+    try:
+        cli.main()
+        assert os.environ["CORTEX_API_CONFIG"] == api_config
+        assert observed["port"] == 8624
+    finally:
+        os.environ.pop("CORTEX_API_CONFIG", None)
+        if previous_api_config is not None:
+            os.environ["CORTEX_API_CONFIG"] = previous_api_config
