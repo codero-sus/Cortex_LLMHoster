@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -41,6 +42,108 @@ def configured_settings(**overrides: object) -> Settings:
     }
     values.update(overrides)
     return Settings(**values)  # type: ignore[arg-type]
+
+
+def update_metadata_transport(version: str) -> httpx.MockTransport:
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        if "/branches/" in request.url.path:
+            return httpx.Response(
+                200,
+                json={"commit": {"sha": "b" * 40}},
+            )
+        if request.url.path.endswith("/contents/pyproject.toml"):
+            content = f'[project]\nversion = "{version}"\n'.encode()
+            return httpx.Response(
+                200,
+                json={"content": base64.b64encode(content).decode("ascii")},
+            )
+        return httpx.Response(404)
+
+    return httpx.MockTransport(upstream)
+
+
+@pytest.mark.asyncio
+async def test_updater_routes_require_admin_authentication(tmp_path) -> None:
+    app = create_app(Settings(), admin_config_path=tmp_path / "cortex.local.json")
+    async with open_client(app) as client:
+        response = await client.get("/admin/api/update/check")
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "admin_auth_not_configured"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_updater_checks_and_installs_pinned_branch(
+    tmp_path, monkeypatch
+) -> None:
+    app = create_app(
+        configured_settings(),
+        transport=update_metadata_transport("0.3.0"),
+        admin_config_path=tmp_path / "config.json",
+    )
+    installed: list[str] = []
+
+    async def fake_install(commit_sha: str) -> str:
+        installed.append(commit_sha)
+        return "Successfully installed cortex-llmhoster"
+
+    monkeypatch.setattr("cortex_llmhoster.dashboard.install_from_commit", fake_install)
+    async with open_client(app) as client:
+        checked = await client.get("/admin/api/update/check", headers=admin_headers())
+        result = await client.post(
+            "/admin/api/update/install",
+            headers=admin_headers(),
+            json={"commit_sha": "b" * 40},
+        )
+
+    assert checked.status_code == 200
+    assert checked.json()["update_available"] is True
+    assert checked.json()["latest_version"] == "0.3.0"
+    assert result.status_code == 200
+    assert result.json()["installed_version"] == "0.3.0"
+    assert result.json()["restart_required"] is True
+    assert installed == ["b" * 40]
+
+
+@pytest.mark.asyncio
+async def test_updater_refuses_multiworker_installation(tmp_path) -> None:
+    app = create_app(
+        configured_settings(workers=2),
+        admin_config_path=tmp_path / "config.json",
+    )
+    async with open_client(app) as client:
+        response = await client.post(
+            "/admin/api/update/install",
+            headers=admin_headers(),
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "update_requires_single_worker"
+
+
+@pytest.mark.asyncio
+async def test_updater_will_not_install_a_commit_other_than_the_confirmed_one(
+    tmp_path, monkeypatch
+) -> None:
+    app = create_app(
+        configured_settings(),
+        transport=update_metadata_transport("0.3.0"),
+        admin_config_path=tmp_path / "config.json",
+    )
+
+    async def unexpected_install(_: str) -> str:
+        raise AssertionError("a changed source must not be installed")
+
+    monkeypatch.setattr("cortex_llmhoster.dashboard.install_from_commit", unexpected_install)
+    async with open_client(app) as client:
+        response = await client.post(
+            "/admin/api/update/install",
+            headers=admin_headers(),
+            json={"commit_sha": "c" * 40},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "update_source_changed"
 
 
 @pytest.mark.asyncio

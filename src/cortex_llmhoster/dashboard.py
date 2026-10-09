@@ -21,6 +21,7 @@ from . import __version__
 from .config import LOCAL_RUNTIMES, ConfigurationError, ModelConfig, Settings
 from .responses import OrjsonResponse
 from .responses import error_response as _error
+from .updater import UpdateError, check_for_updates, install_from_commit
 
 _UI_PATH = Path(__file__).parent / "static" / "index.html"
 _UI_HTML = _UI_PATH.read_text(encoding="utf-8") if _UI_PATH.is_file() else ""
@@ -386,6 +387,80 @@ async def reset_metrics(request: Request) -> Response:
         return auth
     request.app.state.metrics.reset()
     return OrjsonResponse({"ok": True})
+
+
+async def check_updates(request: Request) -> Response:
+    auth = _admin_auth(request, request.app.state.settings)
+    if auth is not None:
+        return auth
+    try:
+        update = await check_for_updates(request.app.state.http_client, __version__)
+    except UpdateError as exc:
+        return _error(
+            str(exc),
+            status_code=503,
+            error_type="server_error",
+            code="update_check_failed",
+        )
+    return OrjsonResponse(update.as_dict())
+
+
+async def install_update(request: Request) -> Response:
+    settings: Settings = request.app.state.settings
+    auth = _admin_auth(request, settings)
+    if auth is not None:
+        return auth
+    if request.app.state.worker_count != 1:
+        return _error(
+            "The updater requires one Cortex worker to avoid concurrent package installation.",
+            status_code=409,
+            code="update_requires_single_worker",
+        )
+    payload, body_error = await _read_json(request)
+    if body_error is not None:
+        return body_error
+    confirmed_commit = payload.get("commit_sha") if isinstance(payload, Mapping) else None
+    if not isinstance(confirmed_commit, str):
+        return _error("Confirm the commit ID shown by the update check.", status_code=400)
+
+    async with request.app.state.update_lock:
+        try:
+            update = await check_for_updates(request.app.state.http_client, __version__)
+            if not update.update_available:
+                return _error(
+                    f"Cortex {__version__} is already at the latest branch version "
+                    f"({update.latest_version}).",
+                    status_code=409,
+                    code="no_update_available",
+                )
+            if update.commit_sha != confirmed_commit:
+                return _error(
+                    "The update branch changed after your check. Check again and confirm the new commit.",
+                    status_code=409,
+                    code="update_source_changed",
+                )
+            output = await install_from_commit(confirmed_commit)
+        except UpdateError as exc:
+            return _error(
+                str(exc),
+                status_code=502,
+                error_type="server_error",
+                code="update_install_failed",
+            )
+
+    return OrjsonResponse(
+        {
+            "ok": True,
+            "current_version": update.current_version,
+            "installed_version": update.latest_version,
+            "source_repository": update.source_repository,
+            "source_ref": update.source_ref,
+            "commit_sha": update.commit_sha,
+            "restart_required": True,
+            "message": "The update was installed. Restart Cortex to load the new version.",
+            "installer_output": output,
+        }
+    )
 
 
 async def update_config(request: Request) -> Response:

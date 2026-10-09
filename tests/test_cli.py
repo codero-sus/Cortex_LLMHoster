@@ -10,6 +10,7 @@ from cortex_llmhoster.config import Settings
 
 
 def test_cli_passes_resolved_listener_and_workers_to_uvicorn(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CORTEX_WORKERS", "2")
     config = tmp_path / "cortex.toml"
     config.write_text(
         """
@@ -44,9 +45,11 @@ workers = 2
     assert observed["host"] == "0.0.0.0"
     assert observed["port"] == 9123
     assert observed["workers"] == 3
+    assert os.environ["CORTEX_WORKERS"] == "3"
 
 
 def test_cli_uses_default_port_8624(monkeypatch) -> None:
+    monkeypatch.delenv("CORTEX_WORKERS", raising=False)
     observed: dict[str, object] = {}
     monkeypatch.setattr(cli.Settings, "load", lambda: Settings())
     monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: observed.update(kwargs))
@@ -58,6 +61,7 @@ def test_cli_uses_default_port_8624(monkeypatch) -> None:
 
 
 def test_cli_accepts_api_config_override(monkeypatch) -> None:
+    monkeypatch.delenv("CORTEX_WORKERS", raising=False)
     observed: dict[str, object] = {}
     api_config = "/tmp/cortex-api.json"
     previous_api_config = os.environ.pop("CORTEX_API_CONFIG", None)

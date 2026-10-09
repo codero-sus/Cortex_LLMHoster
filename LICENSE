@@ -15,7 +15,8 @@ non-exclusive, non-transferable, revocable license to download, install, and run
 an unmodified copy of Cortex LLMHoster for your own personal, non-commercial
 use. This permission is provided without a license fee. Copies obtained from the
 official project repository may be retained as reasonably necessary for that
-permitted use.
+permitted use. You may install an unmodified official Cortex update using the
+built-in updater; this does not permit altering the software yourself.
 
 2. RESTRICTIONS
 
