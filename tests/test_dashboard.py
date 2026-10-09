@@ -51,7 +51,7 @@ async def test_dashboard_is_served_and_admin_api_requires_key(tmp_path) -> None:
         state = await client.get("/admin/api/state")
 
     assert page.status_code == 200
-    assert "Cortex — Local LLM Hoster" in page.text
+    assert "Cortex LLMHoster — Free Local Model Hoster" in page.text
     assert "Chat playground" in page.text
     assert "ULTRA (+1)" in page.text
     assert page.headers["x-frame-options"] == "DENY"
@@ -70,10 +70,42 @@ async def test_authenticated_state_and_metrics_are_available(tmp_path) -> None:
     assert state.status_code == 200
     assert state.json()["models"][0]["id"] == "public-model"
     assert state.json()["models"][0]["runtime"] == "llama.cpp"
+    assert state.json()["api"] == {
+        "format": "openai",
+        "version": 1,
+        "base_path": "/v1",
+        "models_path": "/models",
+        "models_endpoint": "/v1/models",
+    }
     assert "dashboard-secret" not in state.text
     assert metrics.status_code == 200
     assert metrics.json()["in_flight"] == 0
     assert denied.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_dashboard_rejects_remote_model_base_urls(tmp_path) -> None:
+    local_config = tmp_path / "cortex.local.json"
+    app = create_app(configured_settings(), admin_config_path=local_config)
+    payload = {
+        "server": {"default_model": "remote"},
+        "models": [
+            {
+                "id": "remote",
+                "runtime": "command",
+                "base_url": "https://example.invalid/v1",
+                "default": True,
+            }
+        ],
+    }
+
+    async with open_client(app) as client:
+        response = await client.put("/admin/api/config", headers=admin_headers(), json=payload)
+
+    assert response.status_code == 422
+    assert "must be local processes" in response.json()["error"]["message"]
+    assert app.state.settings.default_model == "public-model"
+    assert not local_config.exists()
 
 
 @pytest.mark.asyncio
@@ -244,3 +276,59 @@ async def test_local_model_setup_check_uses_gguf_and_llama_server_paths(tmp_path
     assert response.json()["model_file_exists"] is True
     assert response.json()["runner"] == str(executable)
     assert "stub model" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_command_runtime_capabilities_and_argv_round_trip_through_dashboard(tmp_path) -> None:
+    local_config = tmp_path / "cortex.local.json"
+    app = create_app(configured_settings(), admin_config_path=local_config)
+    command = [
+        "python",
+        "local_api.py",
+        "--model",
+        "{model_path}",
+        "--host",
+        "{host}",
+        "--port",
+        "{port}",
+    ]
+    payload = {
+        "server": {"default_model": "public-model", "workers": 1},
+        "models": [
+            {
+                "id": "public-model",
+                "runtime": "llama.cpp",
+                "model_path": "/models/not-present.gguf",
+                "capabilities": ["text_generation"],
+                "default": True,
+            },
+            {
+                "id": "local-video",
+                "runtime": "command",
+                "model_path": "/models/video-folder",
+                "api_base_path": "/compatible/v1",
+                "health_path": "/ready",
+                "capabilities": ["video_understanding", "video_generation", "ocr"],
+                "runtime_command": command,
+                "default": False,
+            },
+        ],
+    }
+
+    async with open_client(app) as client:
+        saved = await client.put("/admin/api/config", headers=admin_headers(), json=payload)
+        state = await client.get("/admin/api/state", headers=admin_headers())
+        exported = await client.get("/admin/api/config/export", headers=admin_headers())
+
+    assert saved.status_code == 200
+    model = next(row for row in state.json()["models"] if row["id"] == "local-video")
+    assert model["runtime"] == "command"
+    assert model["capabilities"] == ["video_understanding", "video_generation", "ocr"]
+    assert model["runtime_command"] == command
+    assert model["api_base_path"] == "/compatible/v1"
+    assert exported.json()["models"][1]["runtime_command"] == command
+    assert json.loads(local_config.read_text(encoding="utf-8"))["models"][1]["capabilities"] == [
+        "video_understanding",
+        "video_generation",
+        "ocr",
+    ]

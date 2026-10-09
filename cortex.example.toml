@@ -1,8 +1,9 @@
-# Local GGUF hosting with llama.cpp. Copy to cortex.toml and update model_path.
-# Install a llama.cpp build separately; set llama_server_path if not on PATH.
+# Local model hosting with llama.cpp or a per-model local command runtime.
+# Copy to cortex.toml and update local weight/runtime paths.
+# Install runtime dependencies separately; no model weights are auto-downloaded.
 
 [server]
-host = "0.0.0.0"
+host = "127.0.0.1"
 port = 8624
 workers = 1
 log_level = "warning"
@@ -19,11 +20,14 @@ read_timeout = 300.0
 write_timeout = 60.0
 pool_timeout = 5.0
 max_json_body_bytes = 16777216
+# Audio/image/video uploads are spooled to temporary storage and capped here.
+max_media_body_bytes = 2147483648
 max_inference_requests = 8
 
 [[models]]
 id = "qwen-local"
 runtime = "llama.cpp"
+capabilities = ["text_generation"]
 # -1 = Efficient, 0 = Balanced, 1 = ULTRA; validate memory before using 1.
 optimization_level = 0
 model_path = "/models/qwen-instruct-q4_k_m.gguf"
@@ -49,6 +53,19 @@ mlock = false
 embedding = false
 # Optional multimodal projector for a compatible multimodal GGUF.
 # mmproj_path = "/models/mmproj-model-f16.gguf"
+
+# Generic local process adapter for other model families/tasks. The command
+# must start a local OpenAI-compatible HTTP server and bind to {host}/{port}.
+# It can expose chat/vision/OCR/audio/video endpoints supported by that engine.
+# [[models]]
+# id = "multimodal-local"
+# runtime = "command"
+# model_path = "/models/my-multimodal-model"
+# api_base_path = "/v1"
+# health_path = "/health"
+# capabilities = ["text_generation", "vision_understanding", "ocr", "audio_transcription", "audio_generation", "video_understanding", "video_generation", "image_generation"]
+# runtime_command = ["python", "serve_local_model.py", "--model", "{model_path}", "--host", "{host}", "--port", "{port}"]
+# default = false
 
 # Additional local models may be listed here. Only the default model is
 # started automatically; other models can be started from the dashboard.

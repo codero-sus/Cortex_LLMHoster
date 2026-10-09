@@ -18,7 +18,7 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, Response
 
 from . import __version__
-from .config import ConfigurationError, ModelConfig, Settings
+from .config import LOCAL_RUNTIMES, ConfigurationError, ModelConfig, Settings
 from .responses import OrjsonResponse
 from .responses import error_response as _error
 
@@ -43,6 +43,7 @@ _SERVER_FIELDS = (
     "llama_server_path",
     "default_model",
     "max_json_body_bytes",
+    "max_media_body_bytes",
     "connect_timeout",
     "read_timeout",
     "write_timeout",
@@ -147,6 +148,10 @@ def _public_settings(settings: Settings) -> dict[str, Any]:
                 "upstream_model": model.upstream_model,
                 "default": model.id == settings.default_model,
                 "runtime": model.runtime,
+                "capabilities": list(model.effective_capabilities),
+                "runtime_command": list(model.runtime_command),
+                "api_base_path": model.api_base_path,
+                "health_path": model.health_path,
                 "optimization_level": model.optimization_level,
                 "model_path": model.model_path,
                 "threads": model.threads,
@@ -179,6 +184,10 @@ def _persistable_settings(settings: Settings) -> dict[str, Any]:
             "id": model.id,
             "upstream_model": model.upstream_model,
             "runtime": model.runtime,
+            "capabilities": list(model.effective_capabilities),
+            "runtime_command": list(model.runtime_command),
+            "api_base_path": model.api_base_path,
+            "health_path": model.health_path,
             "optimization_level": model.optimization_level,
             "model_path": model.model_path,
             "threads": model.threads,
@@ -212,6 +221,7 @@ def _env_overrides() -> list[str]:
         "CORTEX_LLAMA_SERVER": "llama_server_path",
         "CORTEX_DEFAULT_MODEL": "default_model",
         "CORTEX_MAX_JSON_BODY_BYTES": "max_json_body_bytes",
+        "CORTEX_MAX_MEDIA_BODY_BYTES": "max_media_body_bytes",
         "CORTEX_CONNECT_TIMEOUT": "connect_timeout",
         "CORTEX_READ_TIMEOUT": "read_timeout",
         "CORTEX_WRITE_TIMEOUT": "write_timeout",
@@ -260,11 +270,19 @@ def _candidate_settings(payload: Any, current: Settings) -> Settings:
     for index, raw_model in enumerate(raw_models):
         if not isinstance(raw_model, Mapping):
             raise ConfigurationError(f"models[{index}] must be an object.")
+        if "base_url" in raw_model:
+            raise ConfigurationError(
+                f"models[{index}].base_url is not supported; runtimes must be local processes."
+            )
         models.append(
             {
                 "id": raw_model.get("id"),
                 "upstream_model": raw_model.get("upstream_model") or raw_model.get("id"),
                 "runtime": raw_model.get("runtime", "llama.cpp"),
+                "capabilities": raw_model.get("capabilities", ["text_generation"]),
+                "runtime_command": raw_model.get("runtime_command", []),
+                "api_base_path": raw_model.get("api_base_path", "/v1"),
+                "health_path": raw_model.get("health_path", "/health"),
                 "optimization_level": raw_model.get(
                     "optimization_level", raw_model.get("optimization_profile", 0)
                 ),
@@ -342,6 +360,7 @@ async def admin_state(request: Request) -> Response:
     return OrjsonResponse(
         {
             **_public_settings(settings),
+            "api": request.app.state.api_format.public_dict(),
             "metrics": request.app.state.metrics.snapshot(),
             "runtime": {
                 "hardware": request.app.state.runtime_manager.hardware,
@@ -494,8 +513,8 @@ async def runtime_action(request: Request, action: str) -> Response:
         model = settings.models.get(model_id)
         if model is None:
             return _error("Unknown model.", status_code=404, code="model_not_found")
-        if model.runtime != "llama.cpp":
-            return _error("Only local llama.cpp models have process controls.", status_code=422)
+        if model.runtime not in LOCAL_RUNTIMES:
+            return _error("This model runtime is not managed by Cortex.", status_code=422)
 
         manager = request.app.state.runtime_manager
         try:

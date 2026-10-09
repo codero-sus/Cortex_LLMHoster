@@ -1,4 +1,4 @@
-"""Local llama.cpp process orchestration for low-footprint GGUF hosting."""
+"""Managed local inference process adapters for low-footprint model hosting."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from typing import Any
 
 import httpx
 
-from .config import ModelConfig, Settings
+from .config import LOCAL_RUNTIMES, ModelConfig, Settings
 
 
 def automatic_threads(cpu_count: int | None = None) -> int:
@@ -127,6 +127,47 @@ def build_llama_command(
     return args
 
 
+def build_command_runtime_command(model: ModelConfig, port: int) -> list[str]:
+    """Format argv for a user-selected local OpenAI-compatible runtime process.
+
+    The command is executed without a shell. ``{host}`` is always the loopback
+    address, and ``{port}`` is an ephemeral port owned by Cortex.
+    """
+
+    if not model.runtime_command:
+        raise ValueError("Local command runtime has no executable configured.")
+    if not any("{host}" in argument for argument in model.runtime_command) or not any(
+        "{port}" in argument for argument in model.runtime_command
+    ):
+        raise ValueError("Local runtime command must include {host} and {port} placeholders.")
+
+    values = {
+        "model_path": str(Path(model.model_path).expanduser().resolve())
+        if model.model_path
+        else "",
+        "model_id": model.id,
+        "model_alias": model.upstream_model,
+        "host": "127.0.0.1",
+        "port": str(port),
+        "api_base_path": model.api_base_path,
+        "health_path": model.health_path,
+        "gpu_layers": str(model.gpu_layers),
+        "threads": str(model.threads or automatic_threads()),
+        "context_size": str(model.context_size),
+    }
+    try:
+        return [argument.format_map(values) for argument in model.runtime_command]
+    except (KeyError, ValueError) as exc:
+        raise ValueError(f"Could not format local runtime command: {exc}") from exc
+
+
+def _resolve_executable(executable: str) -> str | None:
+    expanded = str(Path(executable).expanduser())
+    if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+        return expanded
+    return shutil.which(expanded)
+
+
 @dataclass(slots=True)
 class RuntimeSlot:
     model: ModelConfig
@@ -141,12 +182,12 @@ class RuntimeSlot:
     output_task: asyncio.Task[None] | None = None
 
 
-class LlamaServerManager:
-    """Own and supervise one llama.cpp server process per local model.
+class LocalRuntimeManager:
+    """Own and supervise local model-serving processes.
 
-    llama.cpp provides optimized CPU, CUDA, Metal, Vulkan, and other builds;
-    ``gpu_layers=0`` works as CPU-only while ``-1`` requests maximum offload.
-    The HTTP API is bound to loopback and is only reached through Cortex.
+    ``llama.cpp`` has a first-class GGUF adapter. The ``command`` adapter can
+    start any local runtime that exposes OpenAI-compatible inference endpoints.
+    Both bind to loopback and are only reached through Cortex.
     """
 
     def __init__(
@@ -191,10 +232,10 @@ class LlamaServerManager:
             return int(sock.getsockname()[1])
 
     async def start_configured(self) -> None:
-        """Start only the default local model to avoid loading every model into RAM."""
+        """Start only the default model to avoid loading every model into RAM/VRAM."""
 
         default_model = self.settings.models.get(self.settings.default_model or "")
-        if default_model is not None and default_model.runtime == "llama.cpp":
+        if default_model is not None and default_model.runtime in LOCAL_RUNTIMES:
             await self.start(default_model.id)
 
     async def start(self, model_id: str) -> dict[str, Any]:
@@ -202,8 +243,8 @@ class LlamaServerManager:
             model = self.settings.models.get(model_id)
             if model is None:
                 raise KeyError(model_id)
-            if model.runtime != "llama.cpp":
-                raise ValueError("Only local llama.cpp models can be started by Cortex.")
+            if model.runtime not in LOCAL_RUNTIMES:
+                raise ValueError(f"Unsupported local runtime: {model.runtime}")
 
             slot = self._slot(model_id)
             if slot.process is not None and slot.process.returncode is None:
@@ -217,48 +258,78 @@ class LlamaServerManager:
             slot.error = None
             slot.output.clear()
 
-            model_file = Path(model.model_path or "").expanduser().resolve()
-            if not model_file.is_file():
-                slot.status = "error"
-                slot.error = f"GGUF model file not found: {model_file}"
-                return self.state(model_id)
-            if model.mmproj_path and not Path(model.mmproj_path).expanduser().is_file():
-                slot.status = "error"
-                slot.error = f"Multimodal projector file not found: {model.mmproj_path}"
-                return self.state(model_id)
-
-            binary = self._resolve_binary()
-            if not binary:
-                slot.status = "error"
-                slot.error = (
-                    "llama-server was not found. Install a CPU/GPU-enabled llama.cpp build "
-                    "or set server.llama_server_path / CORTEX_LLAMA_SERVER."
+            model_path = Path(model.model_path).expanduser().resolve() if model.model_path else None
+            if model.runtime == "llama.cpp":
+                if model_path is None or not model_path.is_file():
+                    slot.status = "error"
+                    slot.error = f"GGUF model file not found: {model_path or model.model_path}"
+                    return self.state(model_id)
+                if model.mmproj_path and not Path(model.mmproj_path).expanduser().is_file():
+                    slot.status = "error"
+                    slot.error = f"Multimodal projector file not found: {model.mmproj_path}"
+                    return self.state(model_id)
+                binary = self._resolve_binary()
+                if not binary:
+                    slot.status = "error"
+                    slot.error = (
+                        "llama-server was not found. Install a CPU/GPU-enabled llama.cpp build "
+                        "or set server.llama_server_path / CORTEX_LLAMA_SERVER."
+                    )
+                    return self.state(model_id)
+                slot.port = self._free_port()
+                slot.command = build_llama_command(binary, model, slot.port)
+                cwd = str(model_path.parent)
+                runtime_name = "llama-server"
+            else:
+                if model_path is not None and not model_path.exists():
+                    slot.status = "error"
+                    slot.error = f"Local model path not found: {model_path}"
+                    return self.state(model_id)
+                slot.port = self._free_port()
+                try:
+                    slot.command = build_command_runtime_command(model, slot.port)
+                except ValueError as exc:
+                    slot.status = "error"
+                    slot.error = str(exc)
+                    return self.state(model_id)
+                if not slot.command:
+                    slot.status = "error"
+                    slot.error = "Local command runtime has no executable configured."
+                    return self.state(model_id)
+                binary = _resolve_executable(slot.command[0])
+                if not binary:
+                    slot.status = "error"
+                    slot.error = f"Local runtime executable not found: {slot.command[0]}"
+                    return self.state(model_id)
+                slot.command[0] = binary
+                cwd = (
+                    str(model_path if model_path.is_dir() else model_path.parent)
+                    if model_path is not None
+                    else None
                 )
-                return self.state(model_id)
+                runtime_name = "local runtime"
 
-            slot.port = self._free_port()
-            slot.command = build_llama_command(binary, model, slot.port)
             try:
                 slot.process = await asyncio.create_subprocess_exec(
                     *slot.command,
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
-                    cwd=str(model_file.parent),
+                    cwd=cwd,
                 )
             except (OSError, ValueError) as exc:
                 slot.status = "error"
-                slot.error = f"Could not start llama-server: {exc}"
+                slot.error = f"Could not start {runtime_name}: {exc}"
                 slot.process = None
                 return self.state(model_id)
 
             slot.started_at = time.monotonic()
             slot.status = "starting"
             slot.output_task = asyncio.create_task(
-                self._read_output(slot), name=f"llama-output-{model_id}"
+                self._read_output(slot), name=f"runtime-output-{model_id}"
             )
             slot.monitor_task = asyncio.create_task(
-                self._monitor(model_id, slot), name=f"llama-monitor-{model_id}"
+                self._monitor(model_id, slot), name=f"runtime-monitor-{model_id}"
             )
             return self.state(model_id)
 
@@ -276,7 +347,7 @@ class LlamaServerManager:
         process = slot.process
         if process is None or slot.port is None:
             return
-        health_url = f"http://127.0.0.1:{slot.port}/health"
+        health_url = f"http://127.0.0.1:{slot.port}{slot.model.health_path}"
         try:
             while process.returncode is None:
                 if slot.status != "running":
@@ -291,7 +362,7 @@ class LlamaServerManager:
             code = await process.wait()
             if slot.status != "stopped":
                 slot.status = "error"
-                slot.error = f"llama-server exited with code {code}."
+                slot.error = f"Local runtime exited with code {code}."
         except asyncio.CancelledError:
             return
 
@@ -348,10 +419,10 @@ class LlamaServerManager:
         old_local = {
             model.id: model
             for model in old_settings.models.values()
-            if model.runtime == "llama.cpp"
+            if model.runtime in LOCAL_RUNTIMES
         }
         new_local = {
-            model.id: model for model in settings.models.values() if model.runtime == "llama.cpp"
+            model.id: model for model in settings.models.values() if model.runtime in LOCAL_RUNTIMES
         }
         changed = {
             model_id
@@ -359,7 +430,9 @@ class LlamaServerManager:
             if old_local[model_id] != new_local[model_id]
         }
         if old_settings.llama_server_path != settings.llama_server_path:
-            changed.update(new_local)
+            changed.update(
+                model_id for model_id, model in new_local.items() if model.runtime == "llama.cpp"
+            )
         removed = (old_local.keys() - new_local.keys()) | changed
         to_stop = [
             model_id
@@ -369,7 +442,7 @@ class LlamaServerManager:
         old_default = old_settings.models.get(old_settings.default_model or "")
         if (
             old_default is not None
-            and old_default.runtime == "llama.cpp"
+            and old_default.runtime in LOCAL_RUNTIMES
             and old_default.id != settings.default_model
             and old_default.id in self._slots
             and self._slots[old_default.id].process is not None
@@ -385,37 +458,67 @@ class LlamaServerManager:
         new_default = settings.models.get(settings.default_model or "")
         should_start_default = settings.default_model != old_settings.default_model
         should_start_default = should_start_default or settings.default_model in changed
-        if should_start_default and new_default is not None and new_default.runtime == "llama.cpp":
+        if (
+            should_start_default
+            and new_default is not None
+            and new_default.runtime in LOCAL_RUNTIMES
+        ):
             await self.start(new_default.id)
 
     def test(self, model: ModelConfig) -> dict[str, Any]:
-        path = Path(model.model_path or "").expanduser()
-        binary = self._resolve_binary()
-        exists = path.is_file()
-        size = path.stat().st_size if exists else 0
+        path = Path(model.model_path).expanduser() if model.model_path else None
+        exists = path is not None and path.exists()
+        size = path.stat().st_size if exists and path is not None and path.is_file() else 0
         projector_exists = (
             model.mmproj_path is None or Path(model.mmproj_path).expanduser().is_file()
         )
-        ready = exists and projector_exists and binary is not None
-        return {
-            "ok": ready,
-            "runtime": model.runtime,
-            "runner": binary,
-            "model_file_exists": exists,
-            "model_size_bytes": size,
-            "mmproj_file_exists": projector_exists,
-            "message": (
+        if model.runtime == "llama.cpp":
+            runner = self._resolve_binary()
+            ready = bool(
+                exists
+                and path is not None
+                and path.is_file()
+                and path.suffix.lower() == ".gguf"
+                and projector_exists
+                and runner
+            )
+            message = (
                 "Local GGUF, optional projector, and llama-server are ready to start."
                 if ready
                 else "Check the GGUF/projector paths and install/configure llama-server."
-            ),
+            )
+        else:
+            try:
+                command = build_command_runtime_command(model, 1)
+            except ValueError as exc:
+                command = []
+                message = str(exc)
+            runner = _resolve_executable(command[0]) if command else None
+            model_path_ready = model.model_path is None or exists
+            ready = bool(runner and model_path_ready)
+            if command:
+                message = (
+                    "Local command runtime and model path are ready to start."
+                    if ready
+                    else "Check the runtime executable and local model path."
+                )
+        return {
+            "ok": ready,
+            "runtime": model.runtime,
+            "runner": runner,
+            "model_path_exists": exists,
+            "model_file_exists": bool(exists and path is not None and path.is_file()),
+            "model_size_bytes": size,
+            "mmproj_file_exists": projector_exists,
+            "capabilities": list(model.effective_capabilities),
+            "message": message,
         }
 
     def local_base_url(self, model: ModelConfig) -> str | None:
         slot = self._slots.get(model.id)
         if slot is None or slot.status != "running" or slot.port is None:
             return None
-        return f"http://127.0.0.1:{slot.port}/v1"
+        return f"http://127.0.0.1:{slot.port}{model.api_base_path}"
 
     def state(self, model_id: str) -> dict[str, Any]:
         model = self.settings.models.get(model_id)
@@ -427,6 +530,8 @@ class LlamaServerManager:
         uptime = round(time.monotonic() - slot.started_at, 1) if slot.started_at is not None else 0
         return {
             "id": model_id,
+            "runtime": model.runtime,
+            "capabilities": list(model.effective_capabilities),
             "status": slot.status,
             "error": slot.error,
             "pid": slot.process.pid if slot.process is not None else None,
@@ -443,6 +548,10 @@ class LlamaServerManager:
     async def close(self) -> None:
         for model_id in list(self._slots):
             await self.stop(model_id)
+
+
+# Backwards-compatible name retained for callers from the GGUF-only version.
+LlamaServerManager = LocalRuntimeManager
 
 
 def detect_hardware() -> dict[str, Any]:

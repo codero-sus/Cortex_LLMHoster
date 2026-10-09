@@ -5,9 +5,12 @@ import pytest
 from cortex_llmhoster.config import ConfigurationError, Settings
 
 
-def test_default_listener_port_is_8624() -> None:
+def test_default_listener_is_localhost_on_port_8624() -> None:
+    assert Settings().host == "127.0.0.1"
     assert Settings().port == 8624
-    assert Settings.from_mapping({}, environ={}).port == 8624
+    settings = Settings.from_mapping({}, environ={})
+    assert settings.host == "127.0.0.1"
+    assert settings.port == 8624
 
 
 def test_loads_local_gguf_toml_and_reads_api_key_from_environment(tmp_path) -> None:
@@ -107,7 +110,7 @@ base_url = "https://example.test/v1"
         encoding="utf-8",
     )
 
-    with pytest.raises(ConfigurationError, match="hosts local GGUF models only"):
+    with pytest.raises(ConfigurationError, match="runtime must be one of"):
         Settings.load(config, environ={})
 
 
@@ -154,5 +157,92 @@ def test_local_model_path_must_be_gguf(tmp_path) -> None:
     with pytest.raises(ConfigurationError, match="must point to a GGUF file"):
         Settings.from_mapping(
             {"models": [{"id": "not-gguf", "model_path": "/models/model.bin"}]},
+            environ={},
+        )
+
+
+def test_config_accepts_extensible_local_command_runtime_capabilities() -> None:
+    settings = Settings.from_mapping(
+        {
+            "server": {"default_model": "local-vlm"},
+            "models": [
+                {
+                    "id": "local-vlm",
+                    "runtime": "command",
+                    "model_path": "/models/vlm-folder",
+                    "api_base_path": "/openai/v1",
+                    "health_path": "/ready",
+                    "capabilities": [
+                        "text_generation",
+                        "vision-understanding",
+                        "audio_transcription",
+                        "video-generation",
+                        "future_task_v2",
+                    ],
+                    "runtime_command": [
+                        "python",
+                        "server.py",
+                        "--model",
+                        "{model_path}",
+                        "--host",
+                        "{host}",
+                        "--port",
+                        "{port}",
+                    ],
+                }
+            ],
+        },
+        environ={},
+    )
+
+    model = settings.models["local-vlm"]
+    assert settings.default_model == "local-vlm"
+    assert model.runtime == "command"
+    assert model.model_path == "/models/vlm-folder"
+    assert model.api_base_path == "/openai/v1"
+    assert model.health_path == "/ready"
+    assert "vision_understanding" in model.effective_capabilities
+    assert "video_generation" in model.effective_capabilities
+    assert "future_task_v2" in model.effective_capabilities
+    assert model.runtime_command[-2:] == ("--port", "{port}")
+
+
+def test_command_runtime_requires_loopback_host_and_port_placeholders() -> None:
+    with pytest.raises(ConfigurationError, match="must include.*host.*port"):
+        Settings.from_mapping(
+            {
+                "models": [
+                    {
+                        "id": "bad-command",
+                        "runtime": "command",
+                        "capabilities": ["ocr"],
+                        "runtime_command": ["python", "server.py", "--port", "5000"],
+                    }
+                ]
+            },
+            environ={},
+        )
+
+
+def test_command_runtime_does_not_accept_remote_base_urls() -> None:
+    with pytest.raises(ConfigurationError, match="base_url.*not supported"):
+        Settings.from_mapping(
+            {
+                "models": [
+                    {
+                        "id": "not-a-proxy",
+                        "runtime": "command",
+                        "base_url": "https://example.test/v1",
+                        "runtime_command": [
+                            "python",
+                            "server.py",
+                            "--host",
+                            "{host}",
+                            "--port",
+                            "{port}",
+                        ],
+                    }
+                ]
+            },
             environ={},
         )
