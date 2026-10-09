@@ -57,6 +57,9 @@ have counsel review it before relying on it for distribution.
   sizes, CPU threads, parallel slots, memory mapping, KV-cache types, and mlock.
 - **Memory-aware loading:** only the configured default local model starts
   automatically. Other models can be started and stopped from the dashboard.
+- **Manual software updater:** checks the selected project branch on GitHub only
+  when requested; installing an official update requires a single Cortex worker,
+  confirmation, and a restart. It does not replace local weights or configuration.
 - **Lightweight browser UI:** manage models, runtimes and task declarations;
   inspect hardware; chat; use a same-origin modality/API workbench; and
   import/export secret-free configuration.

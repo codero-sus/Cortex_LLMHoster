@@ -7,6 +7,7 @@ import hmac
 import logging
 import os
 import platform
+import ssl
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
@@ -28,8 +29,10 @@ from .dashboard import (
     InferenceMetrics,
     admin_metrics,
     admin_state,
+    check_updates,
     dashboard,
     download_config,
+    install_update,
     reload_config,
     reset_config,
     reset_metrics,
@@ -824,6 +827,7 @@ def create_app(
             limits=limits,
             timeout=timeout,
             transport=transport,
+            verify=ssl.create_default_context(),
             follow_redirects=False,
             trust_env=False,
         )
@@ -903,6 +907,8 @@ def create_app(
         Route("/admin/api/state", admin_state, methods=["GET"]),
         Route("/admin/api/metrics", admin_metrics, methods=["GET"]),
         Route("/admin/api/metrics/reset", reset_metrics, methods=["POST"]),
+        Route("/admin/api/update/check", check_updates, methods=["GET"]),
+        Route("/admin/api/update/install", install_update, methods=["POST"]),
         Route("/admin/api/config", update_config, methods=["PUT"]),
         Route("/admin/api/config/reload", reload_config, methods=["POST"]),
         Route("/admin/api/config/reset", reset_config, methods=["POST"]),
@@ -936,8 +942,10 @@ def create_app(
     )
     app.state.inference_limiter = inference_limiter
     app.state.settings = runtime_settings
+    app.state.worker_count = runtime_settings.workers
     app.state.metrics = InferenceMetrics()
     app.state.admin_lock = asyncio.Lock()
+    app.state.update_lock = asyncio.Lock()
     app.state.admin_config_path = (
         Path(admin_config_path) if admin_config_path is not None else resolve_admin_config_path()
     )

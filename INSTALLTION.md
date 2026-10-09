@@ -252,13 +252,30 @@ OpenAI-compatible client library, set its `base_url` to
 `http://127.0.0.1:8624/v1`; its `api_key` parameter is either the local
 `CORTEX_API_KEY` or any placeholder when server authentication is disabled.
 
+## Software updater
+
+After launching Cortex, open **Settings → Software updates** and choose **Check
+for updates**. The check is manual, sends only version/commit metadata to GitHub,
+and does not run during startup. The update channel currently follows
+`arena/b3072048-cortex-llmhoster`; the updater installs only after you click
+**Install update** and confirm. Installation is supported only with one Cortex
+worker to prevent simultaneous pip operations. The project version must be
+incremented for a new branch update to be reported.
+
+The updater installs the selected immutable commit using the same Python
+interpreter that runs Cortex. It may need access to GitHub and PyPI and write
+access to the active Python environment. After success, stop and restart Cortex
+to load the updated code. Your model weights and TOML/UI configuration are not
+replaced. Do not close the process while pip is installing.
+
 ## Network access and safety
 
 Cortex binds to loopback by default and the managed model subprocesses bind to
 loopback. Do not change the listen host to `0.0.0.0` unless you intentionally
 need LAN/container access. If you expose the listener, configure the local
 bearer key and firewall rules first. Cortex itself does not send prompts, media,
-or the bearer key to a cloud inference service.
+or the bearer key to a cloud inference service. Update checks are a separate,
+user-triggered request to GitHub for project version metadata.
 
 ## More help
 

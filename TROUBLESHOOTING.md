@@ -185,6 +185,37 @@ The JSON or media request exceeded its configured bound. Increase
 uploads use temporary disk storage; ensure the temp volume has sufficient free
 space as well as raising the size limit.
 
+## Updater problems
+
+### No update is available
+
+- Check that **Settings → Software updates** is checking the configured
+  `arena/b3072048-cortex-llmhoster` branch.
+- The updater compares numeric package versions. The project must increment
+  `version` in `pyproject.toml` for a new update to appear; a new commit with the
+  same version is not offered as an update.
+- Update checks run only when you click the button. They need outbound access to
+  the GitHub API; unauthenticated GitHub rate limits may require waiting before
+  trying again.
+
+### Update check or installation failed
+
+- The built-in installer requires one active Cortex worker. If Cortex runs with
+  multiple workers, stop it and relaunch with `--workers 1` before installing.
+- Confirm this machine can reach GitHub. Installing an update also uses pip and
+  may need PyPI access if dependencies changed.
+- Ensure Cortex was installed in a writable virtual environment. A system
+  installation may reject package replacement; reinstall Cortex into a venv
+  rather than running pip with elevated privileges.
+- The update installs into the Python environment used by the running Cortex
+  process. After success, stop and restart Cortex. Do not close the process
+  while pip is installing.
+- If the updater cannot complete, stop Cortex, obtain the official source
+  archive, activate the same environment, and run `python -m pip install
+  --upgrade --force-reinstall .` from the extracted project folder. Local
+  weights and configuration are separate files and are not replaced by this
+  command.
+
 ## Still stuck?
 
 Record the OS, Python version, Cortex version/commit, selected runtime, endpoint,

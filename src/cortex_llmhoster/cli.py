@@ -66,6 +66,10 @@ def main() -> None:
             "Locally managed model runtimes require --workers 1 so model weights are not "
             "loaded once per worker. Use the runtime's own concurrency settings."
         )
+    # Uvicorn worker processes reload the app in child interpreters. Keep the
+    # resolved CLI override visible so process-local features can detect the
+    # actual deployment worker count, not only the TOML value.
+    os.environ["CORTEX_WORKERS"] = str(workers)
 
     # Prefer uvloop + httptools where the platform provides them, while retaining
     # a dependency-light fallback for development and Windows.
