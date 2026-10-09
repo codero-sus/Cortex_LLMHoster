@@ -9,9 +9,9 @@ Cortex routes inference to model servers running on your own machine; prompts
 and media are not sent to a Cortex cloud service. A `CORTEX_API_KEY` may be set
 as a **local bearer secret** to protect this install's API and dashboard—it is
 not a provider credential, and Cortex does not forward it to the model runtime.
-Cortex has no per-token cloud charge. You still need
-a computer, local runtime, model weights, and any required third-party licenses;
-those are not bundled or automatically downloaded.
+Cortex has no per-token cloud charge. You still need a computer, local runtime,
+model weights, and any required third-party licenses; these are not bundled or
+automatically downloaded.
 
 The adaptable runtime layer can host text/chat, embeddings, vision, OCR, audio
 understanding/transcription/generation, image generation, and video tasks when
@@ -67,155 +67,33 @@ have counsel review it before relying on it for distribution.
   responses, streaming with backpressure, and automatic uvloop/httptools use
   where installed.
 
-## Requirements
+## Installation and quick start
 
-- Python 3.11 or newer.
-- A local model runtime and weights. For the built-in `llama.cpp` adapter, use a
-  CPU or compatible GPU build that provides `llama-server` plus a GGUF model.
-  Other backends can use the supervised `command` adapter if they expose the
-  OpenAI-compatible routes you configure.
-- Model weights and runtimes are not bundled or automatically downloaded by
-  Cortex. Obtain them from their publishers and check their separate licenses.
+Cortex needs Python 3.11+ and a local model runtime with its weights. It does
+not require Ollama, a cloud inference account, or a cloud API key. The model
+runtime and weights are installed separately and are not downloaded by Cortex.
 
-## Installation guide
+See the full [installation guide](INSTALLTION.md) for Linux/macOS, Windows
+Command Prompt, Windows PowerShell, `pipx`, local runtime setup, efficiency
+presets, and first-request examples. If anything goes wrong, see
+[Troubleshooting](TROUBLESHOOTING.md).
 
-Cortex itself does not need Ollama, a cloud account, or a cloud inference key.
-The first `pip install` downloads Python package dependencies from PyPI; model
-inference stays on your machine. You must separately install a local runtime and
-obtain its model weights.
-
-### 1. Download and install Cortex
-
-Clone the repository, or download and extract its ZIP from
-[GitHub](https://github.com/codero-sus/Cortex_LLMHoster). In a terminal opened
-inside the extracted project directory, install the application and its Python
-dependencies:
-
-**Linux / macOS**
+Quick start from the repository on Linux/macOS:
 
 ```bash
-git clone https://github.com/codero-sus/Cortex_LLMHoster.git
-cd Cortex_LLMHoster
 python3.11 -m venv .venv
 . .venv/bin/activate
-python -m pip install --upgrade pip
 python -m pip install .
 cp cortex.example.toml cortex.toml
-```
-
-**Windows PowerShell**
-
-```powershell
-git clone https://github.com/codero-sus/Cortex_LLMHoster.git
-Set-Location Cortex_LLMHoster
-py -3.11 -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install .
-Copy-Item cortex.example.toml cortex.toml
-```
-
-`pip install .` performs a normal install; it does not install Ollama, a model
-runtime, or model weights. See the license section before using or sharing the
-software.
-
-### 2. Install a local inference runtime and model
-
-For the built-in adapter, install a CPU-only or hardware-accelerated build of
-llama.cpp that includes `llama-server`. Choose a build compatible with your
-system/GPU and confirm it is available with:
-
-```bash
-llama-server --help
-```
-
-Keep `llama-server` on `PATH`, or set `llama_server_path` in `cortex.toml` (or
-`CORTEX_LLAMA_SERVER`). Download or otherwise obtain a compatible GGUF model
-from its publisher, save it locally, and confirm that its license allows your
-intended non-commercial use. Cortex does not include or fetch the weights.
-
-If you use another backend, install that local engine yourself and configure it
-with `runtime = "command"`; it must accept the loopback host and port provided
-by Cortex and expose the API endpoints you declare.
-
-### 3. Configure for your machine
-
-Edit `cortex.toml`. Replace the example model path with the actual local file.
-The default example binds to `127.0.0.1`, so only this computer can connect.
-Start with CPU mode (`gpu_layers = 0`) or request GPU offload (`gpu_layers = -1`)
-when your llama.cpp build and available VRAM support it. For a low-memory setup,
-keep `parallel = 1`, choose a modest `context_size`, and select the **Efficient
-(-1)** optimization level in the dashboard or config. See [CPU and GPU
-tuning](#cpu-and-gpu-tuning) for all controls.
-
-```toml
-[server]
-host = "127.0.0.1"
-port = 8624
-workers = 1
-default_model = "qwen-local"
-
-[[models]]
-id = "qwen-local"
-runtime = "llama.cpp"
-model_path = "/absolute/path/to/your-model.gguf" # change this
-capabilities = ["text_generation"]
-default = true
-gpu_layers = 0       # 0 = CPU; -1 = maximum GPU offload if supported
-threads = 0          # 0 = automatic
-context_size = 2048
-batch_size = 256
-ubatch_size = 64
-parallel = 1
-optimization_level = -1 # Efficient (-1), Balanced (0), ULTRA (1)
-```
-
-On Windows, use an absolute Windows path, for example
-`model_path = "C:/models/your-model.gguf"`. If Cortex reports that `llama-server`
-or the model file is missing, correct its executable/model path and restart.
-
-### 4. Start Cortex and open the dashboard
-
-For dashboard model management, create a local bearer secret. This is only for
-your Cortex instance—it is **not** a cloud provider key and is never sent to a
-cloud inference service.
-
-**Linux / macOS**
-
-```bash
+# Edit cortex.toml: set model_path to an existing local GGUF file.
 export CORTEX_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 python -m cortex_llmhoster
 ```
 
-**Windows PowerShell**
-
-```powershell
-$env:CORTEX_API_KEY = python -c "import secrets; print(secrets.token_urlsafe(32))"
-python -m cortex_llmhoster
-```
-
-Open <http://127.0.0.1:8624/> and enter the same local secret using the key
-button. The configured default model starts automatically; add other local
-models in **Models** and start them when needed. To use only the inference API,
-you may leave `CORTEX_API_KEY` unset; inference authentication is then disabled,
-but dashboard/admin management endpoints stay locked. Do not bind to `0.0.0.0`
-or expose Cortex to a network unless you understand the access and firewall
-implications.
-
-Check liveness:
-
-```bash
-curl http://127.0.0.1:8624/health
-```
-
-Send a test chat request (with the optional local key enabled):
-
-```bash
-curl http://127.0.0.1:8624/v1/chat/completions \
-  -H "Authorization: Bearer $CORTEX_API_KEY" \
-  -H 'Content-Type: application/json' \
-  -d '{"model":"qwen-local","messages":[{"role":"user","content":"Hi"}],"stream":true}'
-```
+Open <http://127.0.0.1:8624/> and enter that generated secret in the dashboard.
+It is a local access-control token, not a cloud credential. Cortex binds to
+`127.0.0.1` by default; model inference stays on your computer. The software is
+free to use only within the personal, non-commercial terms in [`LICENSE`](LICENSE).
 
 ## Multimodal models and local runtimes
 
