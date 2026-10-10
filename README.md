@@ -98,6 +98,29 @@ It is a local access-control token, not a cloud credential. Cortex binds to
 `127.0.0.1` by default; model inference stays on your computer. The software is
 free to use only within the personal, non-commercial terms in [`LICENSE`](LICENSE).
 
+### Optional custom Python interpreter
+
+Cortex normally keeps using the interpreter that started it. To select a portable
+or embedded interpreter for the CLI, updater, and local command runtimes, add a
+`python.env` file in the project root containing one executable path (absolute,
+or relative to the project root). A line such as `2PY2=/path/to/python` is also
+accepted. The file is ignored by Git so machine-specific paths stay local.
+
+An environment variable named `2PY2` takes precedence over `python.env`; if
+neither is set, Cortex uses the current interpreter. For example, on Linux or
+macOS:
+
+```bash
+/opt/portable-python/bin/python3 -m pip install .
+env '2PY2=/opt/portable-python/bin/python3' python -m cortex_llmhoster
+```
+
+Cortex restarts its CLI under the selected interpreter when needed, so install
+Cortex and its dependencies into that interpreter first. The updater uses the
+same interpreter for pip, and `{python}` in a `runtime_command` resolves to it.
+On Linux/macOS shells where names beginning with a digit cannot be exported, use
+the `env '2PY2=…' command` form shown above or configure `python.env`.
+
 ## Multimodal models and local runtimes
 
 A model's capabilities describe what its model weights and local engine actually
@@ -126,7 +149,7 @@ capabilities = [
   "video_generation",
 ]
 runtime_command = [
-  "python",
+  "{python}",
   "/opt/my-local-openai-server.py",
   "--model",
   "{model_path}",
@@ -140,7 +163,8 @@ runtime_command = [
 `runtime_command` is an argv array executed without a shell. `{host}` and
 `{port}` are required and bind to `127.0.0.1`; `{model_path}`, `{model_id}`,
 `{model_alias}`, `{api_base_path}`, `{health_path}`, `{gpu_layers}`, `{threads}`,
-and `{context_size}` can also be used. Use a local server/wrapper that implements
+`{context_size}`, and `{python}` can also be used. `{python}` resolves to the
+selected interpreter described above. Use a local server/wrapper that implements
 the desired endpoints and a health path returning HTTP 2xx. `model_path` may be a
 file or directory and is optional if the runtime command does not need it.
 

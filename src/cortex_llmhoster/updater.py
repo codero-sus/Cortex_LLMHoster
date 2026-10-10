@@ -6,12 +6,13 @@ import asyncio
 import base64
 import os
 import re
-import sys
 import tomllib
 from dataclasses import dataclass
 from urllib.parse import quote
 
 import httpx
+
+from .python_runtime import PythonInterpreterError, resolve_python_executable
 
 REPOSITORY = "codero-sus/Cortex_LLMHoster"
 UPDATE_REF = "arena/b3072048-cortex-llmhoster"
@@ -154,11 +155,16 @@ async def install_from_commit(commit_sha: str, *, timeout_seconds: float = 300.0
         raise UpdateError("Refusing to install an invalid update commit ID.")
 
     archive_url = f"https://github.com/{REPOSITORY}/archive/{commit_sha}.zip"
+    try:
+        python_executable = resolve_python_executable()
+    except PythonInterpreterError as exc:
+        raise UpdateError(str(exc)) from exc
+
     env = os.environ.copy()
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     try:
         process = await asyncio.create_subprocess_exec(
-            sys.executable,
+            python_executable,
             "-m",
             "pip",
             "install",

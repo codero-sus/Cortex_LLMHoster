@@ -100,6 +100,45 @@ with `--config`. If `pipx` is not on your `PATH`, run `pipx ensurepath` and open
 a new terminal. You still need to install the local model runtime and weights
 separately.
 
+### Optional: select a portable or embedded Python
+
+This setting is cross-platform. Create a `python.env` file in the project root
+with one interpreter path (an absolute path, or one relative to the project
+root). For example, on Linux/macOS:
+
+```bash
+printf '%s\n' '/opt/portable-python/bin/python3' > python.env
+/opt/portable-python/bin/python3 -m pip install .
+python -m cortex_llmhoster
+```
+
+On Windows, the file can contain a path such as
+`C:\portable-python\python.exe`; install Cortex into that interpreter before
+starting it through the project CLI:
+
+```bat
+> python.env echo C:\portable-python\python.exe
+C:\portable-python\python.exe -m pip install .
+python -m cortex_llmhoster
+```
+
+Alternatively, set the environment variable `2PY2` to the interpreter path. It
+is an alternate-Python setting, **not Python 2**. On Linux/macOS, pass it for a
+single command like this (shell variable names starting with a digit cannot be
+exported normally):
+
+```bash
+env '2PY2=/opt/portable-python/bin/python3' python -m cortex_llmhoster
+```
+
+On Windows Command Prompt use `set "2PY2=C:\portable-python\python.exe"`;
+in PowerShell use `Set-Item -Path Env:2PY2 -Value 'C:\portable-python\python.exe'`.
+`2PY2` overrides `python.env`; without either setting, Cortex uses the Python
+that launched it. Cortex re-executes its CLI under the selected interpreter and
+uses it for updater pip installs and the `{python}` local-runtime command
+placeholder. Install Cortex and its dependencies into the selected interpreter
+first. Paths with spaces may be quoted in `python.env`.
+
 ## 3. Install a local runtime and model
 
 ### Built-in llama.cpp runtime

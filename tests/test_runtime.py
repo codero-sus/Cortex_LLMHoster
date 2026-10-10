@@ -250,6 +250,37 @@ def test_command_runtime_templates_are_argv_and_force_loopback(tmp_path: Path) -
     assert command[command.index("--port") + 1] == "8765"
 
 
+def test_command_runtime_uses_selected_python_placeholder(monkeypatch) -> None:
+    selected_python = "/portable/python/bin/python3"
+    monkeypatch.setattr(
+        "cortex_llmhoster.runtime.resolve_python_executable", lambda: selected_python
+    )
+    model = ModelConfig(
+        id="python-command",
+        upstream_model="python-engine",
+        runtime="command",
+        runtime_command=(
+            "{python}",
+            "serve.py",
+            "--host",
+            "{host}",
+            "--port",
+            "{port}",
+        ),
+    )
+
+    command = build_command_runtime_command(model, 8765)
+
+    assert command == [
+        selected_python,
+        "serve.py",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8765",
+    ]
+
+
 def test_command_runtime_skips_unused_path_and_thread_resolution(
     monkeypatch, tmp_path: Path
 ) -> None:

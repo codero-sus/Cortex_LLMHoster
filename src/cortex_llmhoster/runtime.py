@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from .config import LOCAL_RUNTIMES, ModelConfig, Settings
+from .python_runtime import resolve_python_executable
 
 
 @lru_cache(maxsize=1)
@@ -180,6 +181,8 @@ def build_command_runtime_command(model: ModelConfig, port: int) -> list[str]:
         )
     if "threads" in placeholders:
         values["threads"] = str(model.threads or automatic_threads())
+    if "python" in placeholders:
+        values["python"] = resolve_python_executable()
     try:
         return [argument.format_map(values) for argument in model.runtime_command]
     except (KeyError, ValueError) as exc:

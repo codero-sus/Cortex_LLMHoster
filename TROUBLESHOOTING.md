@@ -27,6 +27,18 @@ backend diagnostics; review it before sharing logs publicly.
 - From the project folder, run `python -m pip install .` again.
 - As an alternative to the console command, run `python -m cortex_llmhoster`.
 
+### Cortex cannot use the selected Python interpreter
+
+- `2PY2` takes precedence over the optional root-level `python.env` file. Clear
+  the environment variable or correct the path if it points to an old interpreter.
+- `python.env` should contain exactly one Python executable path; relative paths
+  are resolved from the project root. Confirm that the file exists and that the
+  interpreter is executable (Linux/macOS).
+- Install Cortex and its dependencies into the selected interpreter before
+  starting the CLI; Cortex re-executes under that interpreter when needed.
+- On Linux/macOS, set the digit-leading variable for a single launch with
+  `env '2PY2=/path/to/python3' python -m cortex_llmhoster` rather than `export`.
+
 ### `externally-managed-environment` during `pip install`
 
 This is a system-Python protection (PEP 668). Do not force installation into

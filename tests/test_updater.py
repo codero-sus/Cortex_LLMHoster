@@ -90,6 +90,33 @@ async def test_installer_uses_running_interpreter_and_immutable_archive(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_installer_uses_selected_python_for_pip(monkeypatch) -> None:
+    calls: dict[str, object] = {}
+    selected_python = "/portable/python/bin/python3"
+
+    class FakeProcess:
+        returncode = 0
+
+        async def communicate(self) -> tuple[bytes, bytes]:
+            return b"update complete", b""
+
+    async def fake_create_process(*args: object, **kwargs: object) -> FakeProcess:
+        calls["args"] = args
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "cortex_llmhoster.updater.resolve_python_executable", lambda: selected_python
+    )
+    monkeypatch.setattr(
+        "cortex_llmhoster.updater.asyncio.create_subprocess_exec", fake_create_process
+    )
+
+    await install_from_commit(COMMIT_SHA)
+
+    assert calls["args"][0] == selected_python
+
+
+@pytest.mark.asyncio
 async def test_installer_rejects_untrusted_commit_id_before_starting_pip() -> None:
     with pytest.raises(UpdateError, match="invalid update commit ID"):
         await install_from_commit("https://example.invalid/repo.zip")

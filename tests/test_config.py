@@ -180,7 +180,7 @@ def test_config_accepts_extensible_local_command_runtime_capabilities() -> None:
                         "future_task_v2",
                     ],
                     "runtime_command": [
-                        "python",
+                        "{python}",
                         "server.py",
                         "--model",
                         "{model_path}",
@@ -204,6 +204,7 @@ def test_config_accepts_extensible_local_command_runtime_capabilities() -> None:
     assert "vision_understanding" in model.effective_capabilities
     assert "video_generation" in model.effective_capabilities
     assert "future_task_v2" in model.effective_capabilities
+    assert model.runtime_command[0] == "{python}"
     assert model.runtime_command[-2:] == ("--port", "{port}")
 
 

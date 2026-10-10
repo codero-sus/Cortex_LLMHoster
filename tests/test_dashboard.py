@@ -157,6 +157,7 @@ async def test_dashboard_is_served_and_admin_api_requires_key(tmp_path) -> None:
     assert "Cortex LLMHoster — Free Local Model Hoster" in page.text
     assert "Chat playground" in page.text
     assert "ULTRA (+1)" in page.text
+    assert "{python}" in page.text
     assert 'aria-labelledby="dialog-title"' in page.text
     assert "requestAnimationFrame" in page.text
     assert "setAttribute('aria-current','page')" in page.text
