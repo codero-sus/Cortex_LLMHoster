@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cortex_llmhoster.config import ConfigurationError, Settings
+from cortex_llmhoster.config import ConfigurationError, ModelConfig, Settings
 
 
 def test_default_listener_is_localhost_on_port_8624() -> None:
@@ -205,6 +205,19 @@ def test_config_accepts_extensible_local_command_runtime_capabilities() -> None:
     assert "video_generation" in model.effective_capabilities
     assert "future_task_v2" in model.effective_capabilities
     assert model.runtime_command[-2:] == ("--port", "{port}")
+
+
+def test_effective_capabilities_reuses_declared_tuple_when_no_flags_add_tasks() -> None:
+    model = ModelConfig(
+        id="text-model",
+        upstream_model="text-model",
+        capabilities=("text_generation", "embeddings"),
+    )
+
+    assert model.effective_capabilities is model.capabilities
+    assert model.effective_capabilities is model.effective_capabilities
+    assert model.capability_set == frozenset(model.capabilities)
+    assert model.capability_set is model.capability_set
 
 
 def test_command_runtime_requires_loopback_host_and_port_placeholders() -> None:
