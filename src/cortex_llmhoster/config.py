@@ -33,6 +33,7 @@ _COMMAND_PLACEHOLDERS = frozenset(
         "gpu_layers",
         "threads",
         "context_size",
+        "python",
     }
 )
 

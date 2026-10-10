@@ -7,9 +7,15 @@ import importlib.util
 import os
 
 from .config import LOCAL_RUNTIMES, ConfigurationError, Settings
+from .python_runtime import PythonInterpreterError, reexec_with_selected_python
 
 
 def main() -> None:
+    try:
+        reexec_with_selected_python()
+    except PythonInterpreterError as exc:
+        raise SystemExit(f"Python interpreter selection failed: {exc}") from exc
+
     parser = argparse.ArgumentParser(
         prog="cortex-llmhoster",
         description="Local text and multimodal model hosting with an OpenAI-compatible API.",

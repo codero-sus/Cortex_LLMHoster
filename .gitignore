@@ -16,5 +16,6 @@ dist/
 # Local credentials/configuration
 .env
 .env.*
+python.env
 cortex.toml
 cortex.local.json
