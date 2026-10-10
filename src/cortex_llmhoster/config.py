@@ -9,6 +9,7 @@ import re
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from string import Formatter
 from types import MappingProxyType
@@ -86,6 +87,13 @@ def resolve_admin_config_path(
     return Path(selected_config).with_name("cortex.local.json")
 
 
+@lru_cache(maxsize=128)
+def _capability_index(capabilities: tuple[str, ...]) -> frozenset[str]:
+    """Reuse membership indexes for repeated immutable capability declarations."""
+
+    return frozenset(capabilities)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelConfig:
     """A local model, its task capabilities, and its local runtime adapter."""
@@ -116,17 +124,29 @@ class ModelConfig:
 
     @property
     def effective_capabilities(self) -> tuple[str, ...]:
-        """Return declared tasks plus capabilities implied by legacy llama flags."""
+        """Cache declared tasks plus capabilities implied by legacy llama flags."""
 
-        capabilities = list(self.capabilities)
-        if self.embedding and "embeddings" not in capabilities:
-            capabilities.append("embeddings")
-        if self.mmproj_path and "vision_understanding" not in capabilities:
-            capabilities.append("vision_understanding")
-        return tuple(capabilities)
+        capabilities = (
+            self.capabilities if isinstance(self.capabilities, tuple) else tuple(self.capabilities)
+        )
+        add_embeddings = self.embedding and "embeddings" not in capabilities
+        add_vision = self.mmproj_path and "vision_understanding" not in capabilities
+        if add_embeddings and add_vision:
+            return capabilities + ("embeddings", "vision_understanding")
+        if add_embeddings:
+            return capabilities + ("embeddings",)
+        if add_vision:
+            return capabilities + ("vision_understanding",)
+        return capabilities
+
+    @property
+    def capability_set(self) -> frozenset[str]:
+        """Return a shared cached membership index for the inference hot path."""
+
+        return _capability_index(self.effective_capabilities)
 
     def supports(self, capability: str) -> bool:
-        return capability in self.effective_capabilities
+        return capability in self.capability_set
 
 
 @dataclass(frozen=True, slots=True)

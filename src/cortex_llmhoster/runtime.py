@@ -12,7 +12,9 @@ import subprocess
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
+from string import Formatter
 from typing import Any
 
 import httpx
@@ -20,39 +22,44 @@ import httpx
 from .config import LOCAL_RUNTIMES, ModelConfig, Settings
 
 
-def automatic_threads(cpu_count: int | None = None) -> int:
-    """Choose threads from CPUs available to the process, respecting container limits."""
+@lru_cache(maxsize=1)
+def _available_cpu_count() -> int:
+    """Cache OS, affinity, and cgroup probes for the lifetime of this process."""
 
-    count = cpu_count or os.cpu_count() or 1
-    if cpu_count is None:
-        if hasattr(os, "sched_getaffinity"):
-            try:
-                count = min(count, len(os.sched_getaffinity(0)))
-            except OSError:
-                pass
-        quota_files = (
-            (Path("/sys/fs/cgroup/cpu.max"), "v2"),
-            (Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), "quota"),
-        )
-        for quota_path, format_name in quota_files:
-            try:
-                if format_name == "v2":
-                    quota_text, period_text = quota_path.read_text(encoding="ascii").split()
-                    if quota_text == "max":
-                        continue
-                    quota, period = int(quota_text), int(period_text)
-                else:
-                    quota = int(quota_path.read_text(encoding="ascii").strip())
-                    period = int(
-                        Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
-                        .read_text(encoding="ascii")
-                        .strip()
-                    )
-                if quota > 0 and period > 0:
-                    count = min(count, max(1, math.ceil(quota / period)))
-                    break
-            except (OSError, ValueError):
-                continue
+    count = os.cpu_count() or 1
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            count = min(count, len(os.sched_getaffinity(0)))
+        except OSError:
+            pass
+    quota_files = (
+        (Path("/sys/fs/cgroup/cpu.max"), "v2"),
+        (Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), "quota"),
+    )
+    for quota_path, format_name in quota_files:
+        try:
+            if format_name == "v2":
+                quota_text, period_text = quota_path.read_text(encoding="ascii").split()
+                if quota_text == "max":
+                    continue
+                quota, period = int(quota_text), int(period_text)
+            else:
+                quota = int(quota_path.read_text(encoding="ascii").strip())
+                period = int(
+                    Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read_text(encoding="ascii").strip()
+                )
+            if quota > 0 and period > 0:
+                count = min(count, max(1, math.ceil(quota / period)))
+                break
+        except (OSError, ValueError):
+            continue
+    return max(1, count)
+
+
+def automatic_threads(cpu_count: int | None = None) -> int:
+    """Choose threads from available CPUs, respecting container limits."""
+
+    count = _available_cpu_count() if cpu_count is None else cpu_count or os.cpu_count() or 1
     return max(1, count - 1) if count > 2 else count
 
 
@@ -127,6 +134,17 @@ def build_llama_command(
     return args
 
 
+@lru_cache(maxsize=128)
+def _runtime_command_placeholders(command: tuple[str, ...]) -> frozenset[str]:
+    formatter = Formatter()
+    return frozenset(
+        field_name
+        for argument in command
+        for _, field_name, _, _ in formatter.parse(argument)
+        if field_name
+    )
+
+
 def build_command_runtime_command(model: ModelConfig, port: int) -> list[str]:
     """Format argv for a user-selected local OpenAI-compatible runtime process.
 
@@ -141,10 +159,12 @@ def build_command_runtime_command(model: ModelConfig, port: int) -> list[str]:
     ):
         raise ValueError("Local runtime command must include {host} and {port} placeholders.")
 
+    try:
+        placeholders = _runtime_command_placeholders(tuple(model.runtime_command))
+    except ValueError as exc:
+        raise ValueError(f"Could not format local runtime command: {exc}") from exc
+
     values = {
-        "model_path": str(Path(model.model_path).expanduser().resolve())
-        if model.model_path
-        else "",
         "model_id": model.id,
         "model_alias": model.upstream_model,
         "host": "127.0.0.1",
@@ -152,9 +172,14 @@ def build_command_runtime_command(model: ModelConfig, port: int) -> list[str]:
         "api_base_path": model.api_base_path,
         "health_path": model.health_path,
         "gpu_layers": str(model.gpu_layers),
-        "threads": str(model.threads or automatic_threads()),
         "context_size": str(model.context_size),
     }
+    if "model_path" in placeholders:
+        values["model_path"] = (
+            str(Path(model.model_path).expanduser().resolve()) if model.model_path else ""
+        )
+    if "threads" in placeholders:
+        values["threads"] = str(model.threads or automatic_threads())
     try:
         return [argument.format_map(values) for argument in model.runtime_command]
     except (KeyError, ValueError) as exc:

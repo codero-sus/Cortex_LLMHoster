@@ -551,7 +551,7 @@ async def inference(request: Request) -> Response:
 
         route_path = request.path_params.get("path", "").strip("/")
         required_capabilities = _required_capabilities(route_path, json_body)
-        missing_capabilities = required_capabilities - set(model.effective_capabilities)
+        missing_capabilities = required_capabilities - model.capability_set
         if missing_capabilities:
             missing = ", ".join(sorted(missing_capabilities))
             available = ", ".join(model.effective_capabilities) or "none declared"

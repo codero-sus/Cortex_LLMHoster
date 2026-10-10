@@ -181,7 +181,7 @@ controls:
 | --- | --- |
 | `gpu_layers` | `0` for CPU-only; `-1` for maximum supported GPU offload; positive values offload that many layers. |
 | `optimization_level` | `-1` caps batches at 128/32 for lower memory; `0` uses configured tuning; `1` is ULTRA (batch minima 512/128, q8_0 KV cache, and GPU Flash Attention when set to `auto`). Device selection remains explicit through `gpu_layers`. |
-| `threads` / `threads_batch` | CPU inference and prompt-processing threads; `0` selects Cortex's conservative automatic count. |
+| `threads` / `threads_batch` | CPU inference and prompt-processing threads; `0` selects a conservative, container-aware automatic count. CPU affinity/quota detection is cached for the process lifetime. |
 | `context_size` | Context window in tokens. Reducing it lowers KV-cache memory use. |
 | `batch_size` / `ubatch_size` | Prompt-processing batch limits; smaller values can reduce peak memory. |
 | `parallel` | llama.cpp request slots. Keep at `1` on low-memory systems. |

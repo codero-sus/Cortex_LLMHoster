@@ -11,6 +11,7 @@ from cortex_llmhoster.config import ConfigurationError, ModelConfig, Settings
 from cortex_llmhoster.runtime import (
     LlamaServerManager,
     LocalRuntimeManager,
+    _available_cpu_count,
     automatic_threads,
     build_command_runtime_command,
     build_llama_command,
@@ -40,6 +41,32 @@ def test_automatic_threads_leave_cpu_capacity_for_cortex() -> None:
     assert automatic_threads(1) == 1
     assert automatic_threads(2) == 2
     assert automatic_threads(8) == 7
+
+
+def test_automatic_threads_caches_os_and_container_probes(monkeypatch) -> None:
+    _available_cpu_count.cache_clear()
+    calls = {"cpu": 0, "affinity": 0}
+
+    def cpu_count() -> int:
+        calls["cpu"] += 1
+        return 8
+
+    def affinity(_: int) -> set[int]:
+        calls["affinity"] += 1
+        return set(range(8))
+
+    def missing_cgroup_file(*_: object, **__: object) -> str:
+        raise OSError("no cgroup file")
+
+    monkeypatch.setattr("cortex_llmhoster.runtime.os.cpu_count", cpu_count)
+    monkeypatch.setattr("cortex_llmhoster.runtime.os.sched_getaffinity", affinity, raising=False)
+    monkeypatch.setattr("cortex_llmhoster.runtime.Path.read_text", missing_cgroup_file)
+    try:
+        assert automatic_threads() == 7
+        assert automatic_threads() == 7
+        assert calls == {"cpu": 1, "affinity": 1}
+    finally:
+        _available_cpu_count.cache_clear()
 
 
 def test_build_llama_command_uses_args_and_local_low_memory_options() -> None:
@@ -221,6 +248,35 @@ def test_command_runtime_templates_are_argv_and_force_loopback(tmp_path: Path) -
     assert command[command.index("--served-name") + 1] == "vlm-engine-name"
     assert command[command.index("--host") + 1] == "127.0.0.1"
     assert command[command.index("--port") + 1] == "8765"
+
+
+def test_command_runtime_skips_unused_path_and_thread_resolution(
+    monkeypatch, tmp_path: Path
+) -> None:
+    model = ModelConfig(
+        id="lightweight-command",
+        upstream_model="engine-name",
+        runtime="command",
+        model_path=str(tmp_path / "unused-model-path"),
+        runtime_command=(
+            sys.executable,
+            "serve.py",
+            "--host",
+            "{host}",
+            "--port",
+            "{port}",
+        ),
+    )
+
+    def unexpected_probe(*_: object, **__: object) -> object:
+        raise AssertionError("unused runtime placeholders must not trigger expensive probes")
+
+    monkeypatch.setattr("cortex_llmhoster.runtime.automatic_threads", unexpected_probe)
+    monkeypatch.setattr("cortex_llmhoster.runtime.Path.resolve", unexpected_probe)
+
+    command = build_command_runtime_command(model, 8765)
+
+    assert command == [sys.executable, "serve.py", "--host", "127.0.0.1", "--port", "8765"]
 
 
 @pytest.mark.asyncio
