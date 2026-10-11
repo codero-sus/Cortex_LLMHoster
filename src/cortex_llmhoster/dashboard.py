@@ -18,7 +18,16 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, Response
 
 from . import __version__
+from .auth import (
+    SESSION_COOKIE_NAME,
+    SESSION_TTL_SECONDS,
+    create_session_token,
+    is_authenticated,
+    session_signing_key,
+    verify_admin_credentials,
+)
 from .config import LOCAL_RUNTIMES, ConfigurationError, ModelConfig, Settings
+from .cookbook import cookbook_models
 from .responses import OrjsonResponse
 from .responses import error_response as _error
 from .updater import UpdateError, check_for_updates, install_from_commit
@@ -42,6 +51,7 @@ _SERVER_FIELDS = (
     "log_level",
     "access_log",
     "llama_server_path",
+    "api_auth_enabled",
     "default_model",
     "max_json_body_bytes",
     "max_media_body_bytes",
@@ -112,35 +122,41 @@ def _resize_inference_limiter(request: Request, settings: Settings) -> None:
 
 
 def _admin_auth(request: Request, settings: Settings) -> Response | None:
+    if not settings.api_auth_enabled:
+        return None
     if settings.api_key is None:
         return _error(
-            "Admin APIs are disabled until CORTEX_API_KEY is configured.",
+            "API authentication is enabled but CORTEX_API_KEY is not configured.",
             status_code=503,
             error_type="authentication_error",
             code="admin_auth_not_configured",
         )
-    authorization = request.headers.get("authorization", "")
-    scheme, separator, supplied = authorization.partition(" ")
-    if (
-        not separator
-        or scheme.lower() != "bearer"
-        or not hmac.compare_digest(supplied.encode("utf-8"), settings.api_key.encode("utf-8"))
+    session_secret = session_signing_key(
+        settings.api_key,
+        settings.admin_username,
+        settings.admin_password,
+    )
+    if is_authenticated(
+        settings.api_key,
+        request.headers.get("authorization", ""),
+        request.cookies.get(SESSION_COOKIE_NAME),
+        session_secret=session_secret,
     ):
-        return _error(
-            "A valid bearer token is required.",
-            status_code=401,
-            error_type="authentication_error",
-            code="invalid_api_key",
-            headers={"www-authenticate": "Bearer"},
-        )
-    return None
+        return None
+    return _error(
+        "A valid dashboard account session or bearer API key is required.",
+        status_code=401,
+        error_type="authentication_error",
+        code="invalid_api_key",
+        headers={"www-authenticate": "Bearer"},
+    )
 
 
 def _public_settings(settings: Settings) -> dict[str, Any]:
     return {
         "server": {
             **{name: getattr(settings, name) for name in _SERVER_FIELDS},
-            "api_auth_enabled": settings.api_key is not None,
+            "api_auth_enabled": bool(settings.api_auth_enabled),
             "api_key_env": settings.api_key_env,
         },
         "models": [
@@ -220,6 +236,7 @@ def _env_overrides() -> list[str]:
         "CORTEX_LOG_LEVEL": "log_level",
         "CORTEX_ACCESS_LOG": "access_log",
         "CORTEX_LLAMA_SERVER": "llama_server_path",
+        "CORTEX_API_AUTH_ENABLED": "api_auth_enabled",
         "CORTEX_DEFAULT_MODEL": "default_model",
         "CORTEX_MAX_JSON_BODY_BYTES": "max_json_body_bytes",
         "CORTEX_MAX_MEDIA_BODY_BYTES": "max_media_body_bytes",
@@ -307,6 +324,13 @@ def _candidate_settings(payload: Any, current: Settings) -> Settings:
         )
 
     parse_env = dict(os.environ)
+    # Preserve programmatic keys only in this process-local candidate; never write
+    # them to the saved configuration overlay.
+    if "CORTEX_API_KEY" not in parse_env and current.api_key is not None:
+        parse_env["CORTEX_API_KEY"] = current.api_key
+    if "CORTEX_ADMIN_USERNAME" not in parse_env and current.admin_username is not None:
+        parse_env["CORTEX_ADMIN_USERNAME"] = current.admin_username
+        parse_env["CORTEX_ADMIN_PASSWORD"] = current.admin_password or ""
     # Admin edits are the persisted source for the model registry. Secrets remain
     # environment-only and are resolved by Settings.from_mapping.
     parse_env.pop("CORTEX_MODELS", None)
@@ -315,6 +339,12 @@ def _candidate_settings(payload: Any, current: Settings) -> Settings:
     # keep it in process memory without ever serializing it to the overlay.
     if candidate.api_key is None and current.api_key is not None:
         candidate = replace(candidate, api_key=current.api_key)
+    if candidate.admin_username is None and current.admin_username is not None:
+        candidate = replace(
+            candidate,
+            admin_username=current.admin_username,
+            admin_password=current.admin_password,
+        )
     return candidate
 
 
@@ -334,6 +364,135 @@ def _write_json(path: Path, data: dict[str, Any]) -> None:
         raise
 
 
+def _request_is_https(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0]
+    return request.url.scheme == "https" or forwarded_proto.strip().lower() == "https"
+
+
+def _cookie_samesite(secure: bool) -> str:
+    # A secure, partitioned None cookie also works when a live preview embeds
+    # Cortex under a different top-level site. Plain HTTP stays on Lax.
+    return "none" if secure else "lax"
+
+
+def _mark_cookie_partitioned(response: Response, secure: bool) -> None:
+    if secure:
+        response.headers["set-cookie"] = f"{response.headers['set-cookie']}; Partitioned"
+
+
+async def auth_options(request: Request) -> Response:
+    """Return non-secret login capabilities so the dashboard selects a valid sign-in mode."""
+
+    settings: Settings = request.app.state.settings
+    response = OrjsonResponse(
+        {
+            "api_auth_enabled": bool(settings.api_auth_enabled),
+            "account_login_enabled": (
+                settings.api_auth_enabled
+                and settings.api_key is not None
+                and settings.admin_username is not None
+                and settings.admin_password is not None
+            ),
+            "api_key_login_enabled": bool(settings.api_auth_enabled and settings.api_key is not None),
+        }
+    )
+    response.headers["cache-control"] = "no-store"
+    return response
+
+
+async def auth_login(request: Request) -> Response:
+    settings: Settings = request.app.state.settings
+    if not settings.api_auth_enabled:
+        response = OrjsonResponse({"ok": True, "api_auth_enabled": False})
+        secure = _request_is_https(request)
+        response.delete_cookie(
+            SESSION_COOKIE_NAME,
+            path="/",
+            secure=secure,
+            httponly=True,
+            samesite=_cookie_samesite(secure),
+        )
+        _mark_cookie_partitioned(response, secure)
+        response.headers["cache-control"] = "no-store"
+        return response
+    if settings.api_key is None:
+        return _error(
+            "API authentication is enabled but CORTEX_API_KEY is not configured.",
+            status_code=503,
+            error_type="authentication_error",
+            code="admin_auth_not_configured",
+        )
+    payload, body_error = await _read_json(request, limit=4096)
+    if body_error is not None:
+        return body_error
+    credentials = payload if isinstance(payload, Mapping) else {}
+    supplied_key = credentials.get("api_key")
+    api_key_valid = (
+        settings.api_key is not None
+        and isinstance(supplied_key, str)
+        and hmac.compare_digest(
+            supplied_key.encode("utf-8"), settings.api_key.encode("utf-8")
+        )
+    )
+    account_valid = verify_admin_credentials(
+        credentials.get("username"),
+        credentials.get("password"),
+        settings.admin_username,
+        settings.admin_password,
+    )
+    if not (api_key_valid or account_valid):
+        return _error(
+            "The account credentials or API key are invalid.",
+            status_code=401,
+            error_type="authentication_error",
+            code="invalid_api_key",
+            headers={"www-authenticate": "Bearer"},
+        )
+
+    signing_secret = session_signing_key(
+        settings.api_key,
+        settings.admin_username,
+        settings.admin_password,
+    )
+    if signing_secret is None:
+        return _error(
+            "Account sessions are unavailable because no session signing secret is configured.",
+            status_code=503,
+            error_type="authentication_error",
+            code="admin_auth_not_configured",
+        )
+
+    response = OrjsonResponse({"ok": True, "api_auth_enabled": True})
+    secure = _request_is_https(request)
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        create_session_token(signing_secret),
+        max_age=SESSION_TTL_SECONDS,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite=_cookie_samesite(secure),
+    )
+    _mark_cookie_partitioned(response, secure)
+    response.headers["cache-control"] = "no-store"
+    return response
+
+
+async def auth_logout(request: Request) -> Response:
+    response = OrjsonResponse({"ok": True})
+    secure = _request_is_https(request)
+    response.delete_cookie(
+        SESSION_COOKIE_NAME,
+        path="/",
+        secure=secure,
+        httponly=True,
+        samesite=_cookie_samesite(secure),
+    )
+    _mark_cookie_partitioned(response, secure)
+    response.headers["cache-control"] = "no-store"
+    return response
+
+
 async def dashboard(_: Request) -> Response:
     if not _UI_HTML:
         return Response("Dashboard assets are missing.", status_code=503)
@@ -350,6 +509,18 @@ async def dashboard(_: Request) -> Response:
                 "img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
             ),
         },
+    )
+
+
+async def model_cookbook(request: Request) -> Response:
+    auth = _admin_auth(request, request.app.state.settings)
+    if auth is not None:
+        return auth
+    return OrjsonResponse(
+        {
+            "models": cookbook_models(),
+            "source": "Curated public Hugging Face model cards; Cortex makes no Hub API calls.",
+        }
     )
 
 

@@ -158,6 +158,7 @@ class Settings:
     default_model: str | None = None
     api_key: str | None = None
     api_key_env: str = "CORTEX_API_KEY"
+    api_auth_enabled: bool | None = None
     host: str = "127.0.0.1"
     port: int = 8624
     workers: int = 1
@@ -174,6 +175,24 @@ class Settings:
     max_connections: int = 512
     max_keepalive_connections: int = 128
     keepalive_expiry: float = 30.0
+    admin_username: str | None = None
+    admin_password: str | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.api_key == "":
+            object.__setattr__(self, "api_key", None)
+        if self.admin_username == "":
+            object.__setattr__(self, "admin_username", None)
+        if self.admin_password == "":
+            object.__setattr__(self, "admin_password", None)
+        if (self.admin_username is None) != (self.admin_password is None):
+            raise ConfigurationError(
+                "CORTEX_ADMIN_USERNAME and CORTEX_ADMIN_PASSWORD must be set together."
+            )
+        if self.api_auth_enabled is None:
+            object.__setattr__(
+                self, "api_auth_enabled", bool(self.api_key or self.admin_username)
+            )
 
     @classmethod
     def load(
@@ -502,7 +521,50 @@ class Settings:
         if api_key is None and api_key_env:
             api_key = env.get(api_key_env)
         if api_key == "":
-            raise ConfigurationError("The Cortex API key must not be empty.")
+            api_key = None
+
+        admin_username = env.get("CORTEX_ADMIN_USERNAME")
+        admin_password = env.get("CORTEX_ADMIN_PASSWORD")
+        if admin_username is not None and not isinstance(admin_username, str):
+            raise ConfigurationError("CORTEX_ADMIN_USERNAME must be a string.")
+        if admin_password is not None and not isinstance(admin_password, str):
+            raise ConfigurationError("CORTEX_ADMIN_PASSWORD must be a string.")
+        if admin_username is not None:
+            admin_username = admin_username.strip() or None
+        if admin_password == "":
+            admin_password = None
+        if (admin_username is None) != (admin_password is None):
+            raise ConfigurationError(
+                "Set both CORTEX_ADMIN_USERNAME and CORTEX_ADMIN_PASSWORD for account login."
+            )
+        raw_api_auth: object = env.get(
+            "CORTEX_API_AUTH_ENABLED",
+            server.get("api_auth_enabled", api_key is not None or admin_username is not None),
+        )
+        if isinstance(raw_api_auth, bool):
+            api_auth_enabled = raw_api_auth
+        elif isinstance(raw_api_auth, str) and raw_api_auth.lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            api_auth_enabled = True
+        elif isinstance(raw_api_auth, str) and raw_api_auth.lower() in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }:
+            api_auth_enabled = False
+        else:
+            raise ConfigurationError("api_auth_enabled / CORTEX_API_AUTH_ENABLED must be boolean.")
+        if api_auth_enabled and api_key is None:
+            raise ConfigurationError(
+                "Authentication is enabled but CORTEX_API_KEY is not configured. Set a non-empty "
+                "local API key, or disable authentication with CORTEX_API_AUTH_ENABLED=false "
+                "or --no-api-auth."
+            )
 
         def setting(name: str, env_name: str, default: float, cast: type):
             value = env.get(env_name, server.get(name, default))
@@ -616,6 +678,9 @@ class Settings:
             default_model=default_model,
             api_key=api_key,
             api_key_env=api_key_env,
+            admin_username=admin_username,
+            admin_password=admin_password,
+            api_auth_enabled=api_auth_enabled,
             host=host,
             port=port,
             workers=workers,

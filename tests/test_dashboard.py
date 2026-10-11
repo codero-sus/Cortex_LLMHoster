@@ -63,8 +63,10 @@ def update_metadata_transport(version: str) -> httpx.MockTransport:
 
 
 @pytest.mark.asyncio
-async def test_updater_routes_require_admin_authentication(tmp_path) -> None:
-    app = create_app(Settings(), admin_config_path=tmp_path / "cortex.local.json")
+async def test_updater_routes_require_a_key_when_authentication_is_enabled(tmp_path) -> None:
+    app = create_app(
+        Settings(api_auth_enabled=True), admin_config_path=tmp_path / "cortex.local.json"
+    )
     async with open_client(app) as client:
         response = await client.get("/admin/api/update/check")
 
@@ -147,23 +149,202 @@ async def test_updater_will_not_install_a_commit_other_than_the_confirmed_one(
 
 
 @pytest.mark.asyncio
-async def test_dashboard_is_served_and_admin_api_requires_key(tmp_path) -> None:
-    app = create_app(Settings(), admin_config_path=tmp_path / "cortex.local.json")
+async def test_dashboard_is_served_and_auth_enabled_requires_key(tmp_path) -> None:
+    app = create_app(
+        Settings(api_auth_enabled=True), admin_config_path=tmp_path / "cortex.local.json"
+    )
     async with open_client(app) as client:
         page = await client.get("/")
         state = await client.get("/admin/api/state")
 
     assert page.status_code == 200
     assert "Cortex LLMHoster — Free Local Model Hoster" in page.text
+    assert "https://github.com/codero-sus" in page.text
+    assert "https://the-codero.web.app/" in page.text
     assert "Chat playground" in page.text
     assert "ULTRA (+1)" in page.text
     assert "{python}" in page.text
     assert 'aria-labelledby="dialog-title"' in page.text
+    assert "Local admin username" in page.text
+    assert "Use API key instead" in page.text
+    assert "Authentication-enabled mode requires a local API key." in page.text
+    assert 'placeholder="Local API key"' in page.text
     assert "requestAnimationFrame" in page.text
     assert "setAttribute('aria-current','page')" in page.text
     assert page.headers["x-frame-options"] == "DENY"
     assert state.status_code == 503
     assert state.json()["error"]["code"] == "admin_auth_not_configured"
+
+
+@pytest.mark.asyncio
+async def test_disabled_auth_allows_admin_and_inference_without_a_key(tmp_path) -> None:
+    app = create_app(
+        Settings(api_auth_enabled=False), admin_config_path=tmp_path / "config.json"
+    )
+    async with open_client(app) as client:
+        state = await client.get("/admin/api/state")
+        models = await client.get("/v1/models")
+
+    assert state.status_code == 200
+    assert state.json()["server"]["api_auth_enabled"] is False
+    assert models.status_code == 200
+    assert models.json()["data"] == []
+
+
+@pytest.mark.asyncio
+async def test_dashboard_login_sets_persistent_http_only_session_cookie(tmp_path) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        options = await client.get("/admin/api/auth/options")
+        invalid = await client.post(
+            "/admin/api/auth/login", json={"api_key": "not-the-key"}
+        )
+        login = await client.post(
+            "/admin/api/auth/login", json={"api_key": "dashboard-secret"}
+        )
+        state = await client.get("/admin/api/state")
+        inference_models = await client.get("/v1/models")
+        logout = await client.post("/admin/api/auth/logout")
+        denied_after_logout = await client.get("/admin/api/state")
+
+    cookie = login.headers["set-cookie"]
+    assert options.status_code == 200
+    assert options.json() == {
+        "api_auth_enabled": True,
+        "account_login_enabled": False,
+        "api_key_login_enabled": True,
+    }
+    assert invalid.status_code == 401
+    assert login.status_code == 200
+    assert "httponly" in cookie.lower()
+    assert "max-age=2592000" in cookie.lower()
+    assert "samesite=lax" in cookie.lower()
+    assert "dashboard-secret" not in cookie
+    assert login.headers["cache-control"] == "no-store"
+    assert state.status_code == 200
+    assert inference_models.status_code == 200
+    assert logout.status_code == 200
+    assert denied_after_logout.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_account_login_issues_session_and_bearer_api_key_remains_supported(tmp_path) -> None:
+    app = create_app(
+        configured_settings(
+            admin_username="local-admin",
+            admin_password="correct-horse-battery-staple",
+        ),
+        admin_config_path=tmp_path / "config.json",
+    )
+    async with open_client(app) as client:
+        options = await client.get("/admin/api/auth/options")
+        invalid = await client.post(
+            "/admin/api/auth/login",
+            json={"username": "local-admin", "password": "incorrect"},
+        )
+        login = await client.post(
+            "/admin/api/auth/login",
+            json={"username": "local-admin", "password": "correct-horse-battery-staple"},
+        )
+        state = await client.get("/admin/api/state")
+        inference_models = await client.get("/v1/models")
+        await client.post("/admin/api/auth/logout")
+        bearer_state = await client.get("/admin/api/state", headers=admin_headers())
+
+    cookie = login.headers["set-cookie"]
+    assert options.status_code == 200
+    assert options.json() == {
+        "api_auth_enabled": True,
+        "account_login_enabled": True,
+        "api_key_login_enabled": True,
+    }
+    assert invalid.status_code == 401
+    assert invalid.json()["error"]["message"] == "The account credentials or API key are invalid."
+    assert login.status_code == 200
+    assert "httponly" in cookie.lower()
+    assert "local-admin" not in cookie
+    assert "correct-horse-battery-staple" not in cookie
+    assert state.status_code == 200
+    assert "correct-horse-battery-staple" not in state.text
+    assert "admin_password" not in state.json()["server"]
+    assert inference_models.status_code == 200
+    assert bearer_state.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_https_dashboard_cookie_supports_embedded_preview_and_partitioning(tmp_path) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        response = await client.post(
+            "/admin/api/auth/login",
+            json={"api_key": "dashboard-secret"},
+            headers={"x-forwarded-proto": "https"},
+        )
+
+    cookie = response.headers["set-cookie"].lower()
+    assert response.status_code == 200
+    assert "secure" in cookie
+    assert "httponly" in cookie
+    assert "samesite=none" in cookie
+    assert "partitioned" in cookie
+
+
+@pytest.mark.asyncio
+async def test_cross_origin_cookie_mutation_is_rejected(tmp_path) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        login = await client.post(
+            "/admin/api/auth/login", json={"api_key": "dashboard-secret"}
+        )
+        csrf = await client.post(
+            "/admin/api/auth/logout", headers={"origin": "https://attacker.invalid"}
+        )
+        still_authenticated = await client.get("/admin/api/state")
+
+    assert login.status_code == 200
+    assert csrf.status_code == 403
+    assert csrf.json()["error"]["code"] == "csrf_origin_rejected"
+    assert still_authenticated.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_auth_toggle_persists_without_writing_the_local_secret(tmp_path) -> None:
+    settings = configured_settings(api_auth_enabled=False)
+    config_path = tmp_path / "config.json"
+    app = create_app(settings, admin_config_path=config_path)
+    async with open_client(app) as client:
+        current = await client.get("/admin/api/state")
+        payload = current.json()
+        payload["server"]["api_auth_enabled"] = True
+        saved = await client.put("/admin/api/config", json=payload)
+        denied = await client.get("/admin/api/state")
+        login = await client.post(
+            "/admin/api/auth/login", json={"api_key": "dashboard-secret"}
+        )
+        authorized = await client.get("/admin/api/state")
+
+    saved_json = config_path.read_text(encoding="utf-8")
+    assert current.status_code == 200
+    assert saved.status_code == 200
+    assert denied.status_code == 401
+    assert login.status_code == 200
+    assert authorized.status_code == 200
+    assert '"api_auth_enabled": true' in saved_json
+    assert "dashboard-secret" not in saved_json
+
+
+@pytest.mark.asyncio
+async def test_model_cookbook_is_a_static_searchable_catalog(tmp_path) -> None:
+    app = create_app(Settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        response = await client.get("/admin/api/cookbook")
+
+    payload = response.json()
+    assert response.status_code == 200
+    assert len(payload["models"]) >= 45
+    assert "no Hub API calls" in payload["source"]
+    assert all(model["repo"] and model["task"] and model["format"] for model in payload["models"])
+    assert all("/" in model["repo"] for model in payload["models"])
 
 
 @pytest.mark.asyncio

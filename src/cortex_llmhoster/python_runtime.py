@@ -59,6 +59,39 @@ def _python_env_value(root: Path) -> str | None:
     return value or None
 
 
+def _dotenv_python_value(root: Path) -> str | None:
+    """Read a simple 2PY2 assignment from the ignored project .env file."""
+
+    path = root / ".env"
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PythonInterpreterError(f"Could not read {path}: {exc}") from exc
+
+    selected: str | None = None
+    for line in lines:
+        assignment = line.strip()
+        if not assignment or assignment.startswith("#"):
+            continue
+        if assignment.startswith("export "):
+            assignment = assignment[7:].lstrip()
+        key, separator, raw_value = assignment.partition("=")
+        if not separator or key.strip() != PYTHON_OVERRIDE_ENV:
+            continue
+        raw_value = raw_value.strip()
+        if raw_value[:1] in {"'", '"'}:
+            quote = raw_value[0]
+            closing = raw_value.find(quote, 1)
+            if closing < 0:
+                raise PythonInterpreterError(f"{path} has unmatched quotes for {PYTHON_OVERRIDE_ENV}.")
+            selected = raw_value[1:closing]
+        else:
+            selected = raw_value.split(" #", maxsplit=1)[0].strip()
+    return selected or None
+
+
 def _unquote(value: str, source: str) -> str:
     value = value.strip()
     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
@@ -105,18 +138,22 @@ def resolve_python_executable(
 ) -> str:
     """Return the configured Python, or the interpreter currently running Cortex.
 
-    The ``2PY2`` environment variable takes precedence over ``python.env``.
+    A process ``2PY2`` environment variable takes precedence over ``2PY2`` in
+    the project ``.env`` file; either takes precedence over ``python.env``.
     Relative configured paths are resolved from the project root; bare executable
     names may also be found on ``PATH``. The default is ``sys.executable``.
     """
 
     root = Path(project_root).expanduser().resolve() if project_root else _project_root()
     env = os.environ if environ is None else environ
-    override = env.get(PYTHON_OVERRIDE_ENV, "").strip()
+    override = env.get(PYTHON_OVERRIDE_ENV, "").strip() or _dotenv_python_value(root) or ""
     if override:
-        return _resolve_configured_path(
-            override, root, f"environment variable {PYTHON_OVERRIDE_ENV}"
+        source = (
+            f"environment variable {PYTHON_OVERRIDE_ENV}"
+            if env.get(PYTHON_OVERRIDE_ENV, "").strip()
+            else str(root / ".env")
         )
+        return _resolve_configured_path(override, root, source)
 
     configured = _python_env_value(root)
     if configured:

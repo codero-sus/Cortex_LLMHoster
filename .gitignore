@@ -16,6 +16,10 @@ dist/
 # Local credentials/configuration
 .env
 .env.*
+!.env.example
 python.env
 cortex.toml
 cortex.local.json
+
+# Updater backups contain machine-local JSON configuration
+backups/

@@ -13,6 +13,65 @@ def test_default_listener_is_localhost_on_port_8624() -> None:
     assert settings.port == 8624
 
 
+def test_api_auth_is_switchable_and_requires_a_key_when_enabled() -> None:
+    no_key = Settings.from_mapping({}, environ={})
+    key_defaults_to_on = Settings.from_mapping({}, environ={"CORTEX_API_KEY": "local-secret"})
+    explicit_off = Settings.from_mapping(
+        {}, environ={"CORTEX_API_KEY": "local-secret", "CORTEX_API_AUTH_ENABLED": "false"}
+    )
+    toml_off = Settings.from_mapping({"server": {"api_auth_enabled": False}}, environ={})
+
+    assert no_key.api_auth_enabled is False
+    assert Settings(api_key="").api_auth_enabled is False
+    assert key_defaults_to_on.api_auth_enabled is True
+    assert explicit_off.api_auth_enabled is False
+    assert explicit_off.api_key == "local-secret"
+    assert toml_off.api_auth_enabled is False
+
+    with pytest.raises(ConfigurationError, match="CORTEX_API_KEY is not configured"):
+        Settings.from_mapping({}, environ={"CORTEX_API_AUTH_ENABLED": "true"})
+    with pytest.raises(ConfigurationError, match="must be boolean"):
+        Settings.from_mapping({}, environ={"CORTEX_API_AUTH_ENABLED": "sometimes"})
+
+
+def test_dashboard_account_credentials_are_environment_only_and_pair_with_api_key() -> None:
+    settings = Settings.from_mapping(
+        {},
+        environ={
+            "CORTEX_API_KEY": "local-bearer-secret",
+            "CORTEX_ADMIN_USERNAME": "  local-admin  ",
+            "CORTEX_ADMIN_PASSWORD": "dashboard-password",
+        },
+    )
+
+    assert settings.api_auth_enabled is True
+    assert settings.api_key == "local-bearer-secret"
+    assert settings.admin_username == "local-admin"
+    assert settings.admin_password == "dashboard-password"
+
+    with pytest.raises(ConfigurationError, match="Set both CORTEX_ADMIN_USERNAME"):
+        Settings.from_mapping(
+            {}, environ={"CORTEX_API_KEY": "local-secret", "CORTEX_ADMIN_USERNAME": "admin"}
+        )
+    with pytest.raises(ConfigurationError, match="CORTEX_API_KEY is not configured"):
+        Settings.from_mapping(
+            {},
+            environ={"CORTEX_ADMIN_USERNAME": "admin", "CORTEX_ADMIN_PASSWORD": "password"},
+        )
+
+    account_with_auth_disabled = Settings.from_mapping(
+        {},
+        environ={
+            "CORTEX_ADMIN_USERNAME": "admin",
+            "CORTEX_ADMIN_PASSWORD": "password",
+            "CORTEX_API_AUTH_ENABLED": "false",
+        },
+    )
+    assert account_with_auth_disabled.api_key is None
+    assert account_with_auth_disabled.api_auth_enabled is False
+    assert account_with_auth_disabled.admin_username == "admin"
+
+
 def test_loads_local_gguf_toml_and_reads_api_key_from_environment(tmp_path) -> None:
     config = tmp_path / "cortex.toml"
     config.write_text(
