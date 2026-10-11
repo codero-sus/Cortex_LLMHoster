@@ -6,12 +6,19 @@ other local inference engines through an OpenAI-compatible command runtime.
 
 **No Ollama required. No cloud inference account or cloud API key required.**
 Cortex routes inference to model servers running on your own machine; prompts
-and media are not sent to a Cortex cloud service. A `CORTEX_API_KEY` may be set
-as a **local bearer secret** to protect this install's API and dashboard—it is
-not a provider credential, and Cortex does not forward it to the model runtime.
-Cortex has no per-token cloud charge. You still need a computer, local runtime,
-model weights, and any required third-party licenses; these are not bundled or
-automatically downloaded.
+and media are not sent to a Cortex cloud service. `CORTEX_API_AUTH_ENABLED`
+explicitly turns local API protection on or off. Authentication defaults on
+when a non-empty `CORTEX_API_KEY` or dashboard account username is configured;
+when enabled, a non-empty local `CORTEX_API_KEY` is required. A configured
+username/password adds account sign-in to the dashboard but does not replace the
+API key. Use `CORTEX_API_AUTH_ENABLED=false` or `--no-api-auth` to run without a
+key and allow unauthenticated local requests. The API key is a **local bearer
+secret**, not a provider credential, and Cortex does not forward it to a model
+runtime. Successful dashboard sign-in creates a signed, persistent, HttpOnly
+session cookie for 30 days; API clients can continue to use the bearer key.
+Cortex has no per-token cloud charge. You still
+need a computer, local runtime, model weights, and any required third-party
+licenses; these are not bundled or automatically downloaded.
 
 The adaptable runtime layer can host text/chat, embeddings, vision, OCR, audio
 understanding/transcription/generation, image generation, and video tasks when
@@ -37,6 +44,11 @@ Third-party Python packages, runtimes, and model weights are subject to their
 own licenses. The license text is a project license draft, not legal advice;
 have counsel review it before relying on it for distribution.
 
+## Author and credits
+
+Made with ❤️ by [codero-sus on GitHub](https://github.com/codero-sus).
+Visit the [project website](https://the-codero.web.app/) for more from Codero-Sus.
+
 ## Highlights
 
 - **Two local runtime modes:** first-class llama.cpp/GGUF hosting plus a
@@ -57,12 +69,19 @@ have counsel review it before relying on it for distribution.
   sizes, CPU threads, parallel slots, memory mapping, KV-cache types, and mlock.
 - **Memory-aware loading:** only the configured default local model starts
   automatically. Other models can be started and stopped from the dashboard.
-- **Manual software updater:** checks the selected project branch on GitHub only
-  when requested; installing an official update requires a single Cortex worker,
-  confirmation, and a restart. It does not replace local weights or configuration.
+- **Manual software updater:** the dashboard updater checks the pinned source
+  branch when requested. Root-level `updater.sh` and `updater.bat` fast-forward
+  the complete tracked checkout only from `arena/b3072048-cortex-llmhoster`, first
+  backing up repository JSON files under `backups/`, then reinstalling the local
+  project with the selected Python interpreter. Neither updater switches to
+  `main`; restart Cortex LLMHoster after updating.
+- **Local account sign-in:** optionally configure a single dashboard username
+  and password. A successful sign-in creates a signed HttpOnly cookie; API
+  clients may continue to authenticate with the local bearer key.
 - **Lightweight browser UI:** manage models, runtimes and task declarations;
-  inspect hardware; chat; use a same-origin modality/API workbench; and
-  import/export secret-free configuration.
+  inspect hardware; chat; use a same-origin modality/API workbench; browse a
+  searchable static Hugging Face model cookbook; and import/export secret-free
+  configuration. The cookbook requires no Hub API, HF account, or token.
 - **OpenAI-compatible API:** routes chat, completions, responses, embeddings,
   image/audio/video endpoints, and backend-defined paths to the selected local
   process. A route is usable only when that backend implements it.
@@ -93,22 +112,50 @@ export CORTEX_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(
 python -m cortex_llmhoster
 ```
 
-Open <http://127.0.0.1:8624/> and enter that generated secret in the dashboard.
-It is a local access-control token, not a cloud credential. Cortex binds to
-`127.0.0.1` by default; model inference stays on your computer. The software is
-free to use only within the personal, non-commercial terms in [`LICENSE`](LICENSE).
+Open <http://127.0.0.1:8624/>. Without account variables, choose **Use API key
+instead** and enter the generated key. For username/password dashboard sign-in,
+keep the API key configured and also set both optional account variables before
+launching:
+
+```bash
+export CORTEX_ADMIN_USERNAME=admin
+export CORTEX_ADMIN_PASSWORD='replace-with-a-long-unique-password'
+```
+
+The dashboard validates account credentials on the server and stores only a
+signed HttpOnly session cookie for 30 days; it does not store passwords or API
+keys in browser storage. Account sessions are tied to the configured API key and
+account credentials. Authentication-enabled mode always requires
+`CORTEX_API_KEY`; configure account credentials too if you want account-based
+dashboard sign-in alongside bearer-key access. To run without an API key, unset
+it from the environment and disable authentication, for example:
+`unset CORTEX_API_KEY && python -m cortex_llmhoster --no-api-auth`, or set
+`CORTEX_API_AUTH_ENABLED=false` (also available as `api_auth_enabled = false`
+under `[server]` in `cortex.toml`). Anonymous access should only be used on a
+trusted local listener. Cortex binds to `127.0.0.1` by default; model inference
+stays on your computer. The software is free to use only within the personal,
+non-commercial terms in [`LICENSE`](LICENSE).
 
 ### Optional custom Python interpreter
 
-Cortex normally keeps using the interpreter that started it. To select a portable
-or embedded interpreter for the CLI, updater, and local command runtimes, add a
-`python.env` file in the project root containing one executable path (absolute,
-or relative to the project root). A line such as `2PY2=/path/to/python` is also
-accepted. The file is ignored by Git so machine-specific paths stay local.
+Cortex LLMHoster normally keeps using the interpreter that started it. To
+select a portable or embedded interpreter for the CLI, updater, and local command
+runtimes, add a `python.env` file in the project root containing one executable
+path (absolute, or relative to the project root). A line such as
+`2PY2=/path/to/python` is also accepted. This machine-specific file is ignored
+by Git.
 
-An environment variable named `2PY2` takes precedence over `python.env`; if
-neither is set, Cortex uses the current interpreter. For example, on Linux or
-macOS:
+Alternatively, copy [`.env.example`](.env.example) to `.env` and set
+`2PY2=/absolute/path/to/python`. The CLI loads `.env` for interpreter and local
+account settings; root updater scripts read it to choose Python. `.env` is
+ignored by Git; only the sample is tracked. A process environment `2PY2` takes precedence, followed by
+`2PY2` in `.env`, then `python.env`, and finally the interpreter that started
+the command. On Linux or macOS:
+
+```bash
+cp .env.example .env
+# Edit .env and replace /absolute/path/to/python with your interpreter.
+```
 
 ```bash
 /opt/portable-python/bin/python3 -m pip install .
@@ -272,7 +319,25 @@ Dashboard edits are validated and atomically written to `cortex.local.json` (or
 the path in `CORTEX_ADMIN_CONFIG`), leaving the startup TOML unchanged. Secret
 values are never stored in that JSON file; use environment variable names for
 credentials. Active local model processes are restarted when their runtime
-settings change.
+settings change. The Settings page includes an explicit **Require authenticated
+API access** switch. When enabled, dashboard sign-in accepts the configured local
+admin account or API key; API clients can use bearer keys when configured. The
+resulting HMAC-signed HttpOnly cookie is valid for 30 days and stores no password
+or API key. It is signed using the configured API key and, when present, the
+account credentials. It uses SameSite=Lax on plain HTTP. Over HTTPS it is Secure,
+SameSite=None, and Partitioned so embedded previews can retain the session;
+unsafe cookie-authenticated requests also validate their Origin. Authentication
+cannot be enabled without a non-empty `CORTEX_API_KEY`; configure the optional
+admin account for dashboard username/password sign-in. Turning authentication
+off removes the dashboard cookie and allows admin and inference API access
+without credentials, so only do this on a trusted local listener. Changing the
+API key or either account credential revokes existing dashboard sessions.
+
+The **Model cookbook** is a bundled static catalog of public Hugging Face
+repository links with task/format filters. It makes no Hugging Face API requests
+and does not require an HF login or token to browse. Repository access and files
+can change; check each model card's license, usage conditions, quantization,
+format, and local runtime compatibility before downloading or using a model.
 
 ### Useful environment variables
 
@@ -284,7 +349,9 @@ settings change.
 | `CORTEX_HOST` / `CORTEX_PORT` | `127.0.0.1` / `8624` | Local-only listen address by default; use `0.0.0.0` only when intentionally exposing the service. |
 | `CORTEX_WORKERS` | `1` | Uvicorn worker count; local model hosting requires one. |
 | `CORTEX_LLAMA_SERVER` | `PATH` lookup | Path to the `llama-server` executable. |
-| `CORTEX_API_KEY` | unset | Optional local bearer secret for API/admin access; not a cloud-provider key. Admin endpoints stay locked when unset. |
+| `CORTEX_API_KEY` | unset | Local bearer secret; required when authentication is enabled and never a cloud-provider key. Omit it when authentication is disabled. |
+| `CORTEX_ADMIN_USERNAME` / `CORTEX_ADMIN_PASSWORD` | unset | Optional single local dashboard account. Set both alongside the required API key for account sign-in; credentials are never written to `cortex.local.json` or browser storage. |
+| `CORTEX_API_AUTH_ENABLED` | on iff a non-empty API key or admin username is configured | Enables/disables auth for admin and inference APIs. When on, a non-empty API key is required; the account is optional. `false` permits unauthenticated requests. The equivalent TOML field is `[server].api_auth_enabled`. |
 | `CORTEX_DEFAULT_MODEL` | config-derived | Default public model ID. |
 | `CORTEX_LOG_LEVEL` / `CORTEX_ACCESS_LOG` | `warning` / `false` | Server logging controls. |
 | `CORTEX_MAX_JSON_BODY_BYTES` | `16777216` | Maximum buffered JSON body size. |
@@ -292,8 +359,9 @@ settings change.
 | `CORTEX_MAX_INFERENCE_REQUESTS` | Up to `8` | Active inference body/stream limit, capped by `max_connections`; excess requests receive HTTP 503 with `Retry-After`. |
 
 CLI options `--host`, `--port`, `--workers`, `--log-level`, and
-`--access-log` override their TOML/environment values. `--api-config` selects the
-OpenAI-compatible route config JSON. For locally managed
+`--access-log` override their TOML/environment values. `--no-api-auth` disables
+all API/dashboard authentication, allowing a keyless open local server;
+`--api-config` selects the OpenAI-compatible route config JSON. For locally managed
 models, `--workers` must resolve to `1` to avoid duplicate model processes.
 
 ## Endpoints
@@ -306,8 +374,15 @@ models, `--workers` must resolve to `1` to avoid duplicate model processes.
   routes implemented by each selected local runtime.
 - `/v1/audio/*`, `/v1/images/*`, `/v1/videos/*`, `/v1/ocr` — multimodal or
   backend-defined routes; availability depends on that model's runtime.
-- `/admin/api/*` — authenticated settings, runtime controls, process logs and
-  per-worker metrics.
+- `GET /admin/api/auth/options` — public non-secret login-capability flags used
+  to choose account or API-key mode in the sign-in form.
+- `/admin/api/auth/login` and `/admin/api/auth/logout` — dashboard session
+  creation/removal; login verifies configured local admin credentials or the
+  local API key and issues/removes the signed cookie.
+- `/admin/api/state`, `/admin/api/cookbook`, and other `/admin/api/*` routes —
+  settings, the static model catalog, runtime controls, process logs, and
+  per-worker metrics. They accept the session cookie or a bearer key when auth is
+  enabled, and no key when auth is disabled.
 
 ## Maintainer test commands
 

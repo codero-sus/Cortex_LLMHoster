@@ -6,11 +6,15 @@ import argparse
 import importlib.util
 import os
 
+from dotenv import load_dotenv
+
+from . import python_runtime
 from .config import LOCAL_RUNTIMES, ConfigurationError, Settings
 from .python_runtime import PythonInterpreterError, reexec_with_selected_python
 
 
 def main() -> None:
+    load_dotenv(dotenv_path=python_runtime._project_root() / ".env", override=False)
     try:
         reexec_with_selected_python()
     except PythonInterpreterError as exc:
@@ -22,6 +26,11 @@ def main() -> None:
     )
     parser.add_argument("--config", help="TOML config file (default: ./cortex.toml)")
     parser.add_argument("--api-config", help="OpenAI-compatible API route config JSON.")
+    parser.add_argument(
+        "--no-api-auth",
+        action="store_true",
+        help="Run without API/dashboard authentication; no API key is required.",
+    )
     parser.add_argument("--host", help="Listen address (overrides TOML/environment).")
     parser.add_argument("--port", type=int, help="Listen port (overrides TOML/environment).")
     parser.add_argument(
@@ -54,6 +63,8 @@ def main() -> None:
         os.environ["CORTEX_CONFIG"] = args.config
     if args.api_config:
         os.environ["CORTEX_API_CONFIG"] = args.api_config
+    if args.no_api_auth:
+        os.environ["CORTEX_API_AUTH_ENABLED"] = "false"
 
     try:
         settings = Settings.load()

@@ -133,14 +133,31 @@ own machine; Cortex does not promise a specific tokens-per-second rate.
 
 ### Dashboard says admin connection is needed or returns 401
 
-- `CORTEX_API_KEY` must be set in the environment of the running Cortex process
-  before startup if you want dashboard/admin management.
-- Enter the exact secret value into the dashboard key prompt; do not include the
-  `Bearer ` prefix there. The browser stores it in local storage.
-- If the key changed, restart Cortex and re-enter the new value in the browser.
-- This is local access control, not a cloud credential. If the key is unset,
-  inference routes are unauthenticated but admin/config/model-management routes
-  stay locked.
+- Authentication is controlled by `CORTEX_API_AUTH_ENABLED` or
+  `[server].api_auth_enabled`. When unset, it defaults on if a non-empty
+  `CORTEX_API_KEY` or `CORTEX_ADMIN_USERNAME` is configured and off otherwise.
+  When enabled, a non-empty `CORTEX_API_KEY` is required; admin account
+  variables are optional and add username/password dashboard sign-in.
+- For account sign-in, configure both `CORTEX_ADMIN_USERNAME` and
+  `CORTEX_ADMIN_PASSWORD` alongside the API key in the environment or ignored
+  project-root `.env`. If no account is configured, the login form defaults to
+  key mode; enter the exact local key without quotes or the `Bearer ` prefix.
+- To run without a key and without authentication, remove/unset
+  `CORTEX_API_KEY`, then launch with `python -m cortex_llmhoster --no-api-auth`
+  or set
+  `CORTEX_API_AUTH_ENABLED=false`. This opens dashboard and inference APIs, so
+  only use it on a trusted local listener.
+- Successful sign-in creates a signed 30-day HttpOnly cookie; passwords and API
+  keys are not stored in browser storage or the cookie. API clients can continue
+  sending `Authorization: Bearer <key>`.
+- If credentials change, restart Cortex and sign in again. Changing the API key
+  or either account credential invalidates old sessions; use **Log out** to remove
+  the current browser session.
+- If the page still rejects correct credentials, confirm it is the preview for
+  the same Uvicorn port serving the backend. The dashboard and login route are
+  same-origin; opening a different port may connect to another server instance.
+- This is local access control, not a cloud credential. Disabling auth is unsafe
+  on a network reachable by untrusted clients.
 
 ### `Address already in use` or the browser cannot connect
 
@@ -222,8 +239,17 @@ space as well as raising the size limit.
 - The update installs into the Python environment used by the running Cortex
   process. After success, stop and restart Cortex. Do not close the process
   while pip is installing.
-- If the updater cannot complete, stop Cortex, obtain the official source
-  archive, activate the same environment, and run `python -m pip install
+- The root-level `updater.sh` / `updater.bat` scripts require Git and the
+  checkout to already be on `arena/b3072048-cortex-llmhoster`; they deliberately
+  do not switch to `main`. Check `git branch --show-current` before running.
+- Each script creates a timestamped JSON backup under `backups/` before fetching.
+  If a fast-forward is blocked by local changes or divergent commits, the backup
+  remains intact; resolve or stash the changes, then rerun the updater.
+- These scripts update all tracked checkout files, then reinstall the project
+  with the selected Python. Copy `.env.example` to `.env` and set `2PY2` if you
+  need to choose that interpreter. Restart Cortex LLMHoster after the update.
+- If the updater cannot complete, stop Cortex LLMHoster, obtain the official
+  source archive, activate the same environment, and run `python -m pip install
   --upgrade --force-reinstall .` from the extracted project folder. Local
   weights and configuration are separate files and are not replaced by this
   command.

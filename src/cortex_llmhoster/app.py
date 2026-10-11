@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import logging
 import os
 import platform
@@ -12,27 +11,32 @@ from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from time import time
-from urllib.parse import parse_qsl, quote, urlencode
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 import orjson
 from starlette.applications import Starlette
-from starlette.datastructures import UploadFile
+from starlette.datastructures import Headers, UploadFile
 from starlette.middleware import Middleware
 from starlette.requests import Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
 from .api_config import APIFormatConfig
+from .auth import SESSION_COOKIE_NAME, is_authenticated, session_signing_key
 from .config import ConfigurationError, ModelConfig, Settings, resolve_admin_config_path
 from .dashboard import (
     InferenceMetrics,
     admin_metrics,
     admin_state,
+    auth_login,
+    auth_logout,
+    auth_options,
     check_updates,
     dashboard,
     download_config,
     install_update,
+    model_cookbook,
     reload_config,
     reset_config,
     reset_metrics,
@@ -72,25 +76,35 @@ def _initial_hardware_snapshot() -> dict[str, object]:
 
 
 def _auth_error(request: Request, settings: Settings) -> Response | None:
+    if not settings.api_auth_enabled:
+        return None
     expected = settings.api_key
     if expected is None:
-        return None
-
-    authorization = request.headers.get("authorization", "")
-    scheme, separator, supplied = authorization.partition(" ")
-    if (
-        not separator
-        or scheme.lower() != "bearer"
-        or not hmac.compare_digest(supplied.encode("utf-8"), expected.encode("utf-8"))
-    ):
         return _error(
-            "A valid bearer token is required.",
-            status_code=401,
+            "API authentication is enabled but CORTEX_API_KEY is not configured.",
+            status_code=503,
             error_type="authentication_error",
-            code="invalid_api_key",
-            headers={"www-authenticate": "Bearer"},
+            code="admin_auth_not_configured",
         )
-    return None
+    session_secret = session_signing_key(
+        expected,
+        settings.admin_username,
+        settings.admin_password,
+    )
+    if is_authenticated(
+        expected,
+        request.headers.get("authorization", ""),
+        request.cookies.get(SESSION_COOKIE_NAME),
+        session_secret=session_secret,
+    ):
+        return None
+    return _error(
+        "A valid dashboard account session or bearer API key is required.",
+        status_code=401,
+        error_type="authentication_error",
+        code="invalid_api_key",
+        headers={"www-authenticate": "Bearer"},
+    )
 
 
 def _select_model(
@@ -797,6 +811,52 @@ class InferenceCapacityMiddleware:
             self._limiter.release()
 
 
+class SessionOriginMiddleware:
+    """Reject cross-origin unsafe browser requests authenticated by a session cookie."""
+
+    _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+    def __init__(self, app, *, cookie_name: str) -> None:
+        self.app = app
+        self.cookie_name = f"{cookie_name}="
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") == "http" and scope.get("method") not in self._SAFE_METHODS:
+            headers = Headers(scope=scope)
+            cookies = headers.get("cookie", "").split(";")
+            has_session = any(part.strip().startswith(self.cookie_name) for part in cookies)
+            if has_session:
+                origin = headers.get("origin")
+                if origin:
+                    parsed_origin = urlsplit(origin)
+                    forwarded_scheme = headers.get("x-forwarded-proto", "").split(",", 1)[0]
+                    request_scheme = (forwarded_scheme or scope.get("scheme", "http")).strip()
+                    forwarded_host = headers.get("x-forwarded-host", "").split(",", 1)[0]
+                    request_host = (forwarded_host or headers.get("host", "")).strip()
+                    if (
+                        parsed_origin.scheme.lower() != request_scheme.lower()
+                        or parsed_origin.netloc.lower() != request_host.lower()
+                    ):
+                        response = _error(
+                            "Cross-origin session requests are not allowed.",
+                            status_code=403,
+                            error_type="authentication_error",
+                            code="csrf_origin_rejected",
+                        )
+                        await response(scope, receive, send)
+                        return
+                elif headers.get("sec-fetch-site", "").lower() == "cross-site":
+                    response = _error(
+                        "Cross-origin session requests are not allowed.",
+                        status_code=403,
+                        error_type="authentication_error",
+                        code="csrf_origin_rejected",
+                    )
+                    await response(scope, receive, send)
+                    return
+        await self.app(scope, receive, send)
+
+
 def create_app(
     settings: Settings | None = None,
     *,
@@ -904,7 +964,11 @@ def create_app(
 
     routes = [
         Route("/", dashboard, methods=["GET"]),
+        Route("/admin/api/auth/options", auth_options, methods=["GET"]),
+        Route("/admin/api/auth/login", auth_login, methods=["POST"]),
+        Route("/admin/api/auth/logout", auth_logout, methods=["POST"]),
         Route("/admin/api/state", admin_state, methods=["GET"]),
+        Route("/admin/api/cookbook", model_cookbook, methods=["GET"]),
         Route("/admin/api/metrics", admin_metrics, methods=["GET"]),
         Route("/admin/api/metrics/reset", reset_metrics, methods=["POST"]),
         Route("/admin/api/update/check", check_updates, methods=["GET"]),
@@ -932,6 +996,7 @@ def create_app(
         routes=routes,
         lifespan=lifespan,
         middleware=[
+            Middleware(SessionOriginMiddleware, cookie_name=SESSION_COOKIE_NAME),
             Middleware(
                 InferenceCapacityMiddleware,
                 limiter=inference_limiter,

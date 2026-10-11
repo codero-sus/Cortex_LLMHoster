@@ -9,6 +9,11 @@ workers = 1
 log_level = "warning"
 access_log = false
 api_key_env = "CORTEX_API_KEY"
+# Optional API/admin protection switch. Defaults on when a non-empty API key or
+# local admin username is configured; true requires CORTEX_API_KEY. Admin
+# account credentials add dashboard username/password sign-in. False permits
+# anonymous requests. Keep credentials in the environment/.env.
+# api_auth_enabled = false
 default_model = "qwen-local"
 # Optional absolute path to llama-server; defaults to PATH lookup.
 # llama_server_path = "/usr/local/bin/llama-server"

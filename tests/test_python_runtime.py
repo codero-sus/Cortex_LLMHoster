@@ -42,6 +42,30 @@ def test_2py2_environment_override_takes_precedence(tmp_path: Path) -> None:
     assert selected == str(from_env.resolve())
 
 
+def test_project_dotenv_2py2_precedes_python_env(tmp_path: Path) -> None:
+    from_dotenv = executable(tmp_path / "portable python")
+    from_python_env = executable(tmp_path / "python-env-interpreter")
+    (tmp_path / ".env").write_text(f'2PY2="{from_dotenv}"\n', encoding="utf-8")
+    (tmp_path / "python.env").write_text(str(from_python_env), encoding="utf-8")
+
+    selected = resolve_python_executable(project_root=tmp_path, environ={})
+
+    assert selected == str(from_dotenv.resolve())
+
+
+def test_process_2py2_still_overrides_dotenv_and_python_env(tmp_path: Path) -> None:
+    from_environment = executable(tmp_path / "environment-python")
+    (tmp_path / ".env").write_text("2PY2=/missing/from-dotenv\n", encoding="utf-8")
+    (tmp_path / "python.env").write_text("/missing/from-python-env\n", encoding="utf-8")
+
+    selected = resolve_python_executable(
+        project_root=tmp_path,
+        environ={"2PY2": str(from_environment)},
+    )
+
+    assert selected == str(from_environment.resolve())
+
+
 def test_python_env_accepts_a_quoted_2py2_assignment(tmp_path: Path) -> None:
     selected = executable(tmp_path / "portable python")
     (tmp_path / "python.env").write_text(f'\ufeff2PY2="{selected}"\n', encoding="utf-8")
