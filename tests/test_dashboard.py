@@ -164,8 +164,13 @@ async def test_dashboard_is_served_and_auth_enabled_requires_key(tmp_path) -> No
     assert "Chat playground" in page.text
     assert "Use ULTRA tuning (optional)" in page.text
     assert "Choose supported tasks (optional)" in page.text
+    assert 'id="browse-model-file"' in page.text
+    assert 'id="model-file-input"' in page.text
+    assert "Browse this device…" in page.text
+    assert "Use a GGUF already on this Cortex server" in page.text
+    assert "/admin/api/models/files/upload" in page.text
+    assert "xhr.send(file)" in page.text
     assert 'id="model-file-select"' in page.text
-    assert "Choose a local GGUF file" in page.text
     assert 'id="manual-model-path-toggle"' in page.text
     assert "Enter a model path manually" in page.text
     assert "/admin/api/models/files" in page.text
@@ -768,6 +773,89 @@ async def test_model_file_picker_requires_admin_auth_and_lists_local_gguf_files(
             "size_bytes": model_file.stat().st_size,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_model_file_upload_requires_admin_auth_and_streams_to_local_storage(
+    tmp_path, monkeypatch
+) -> None:
+    model_directory = tmp_path / "models"
+    monkeypatch.setenv("CORTEX_MODELS_DIR", str(model_directory))
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    content = b"GGUF local model fixture"
+    url = "/admin/api/models/files/upload"
+    headers = {**admin_headers(), "Content-Type": "application/octet-stream"}
+
+    async with open_client(app) as client:
+        denied = await client.post(url, params={"filename": "local.gguf"}, content=content)
+        uploaded = await client.post(
+            url, params={"filename": "local.gguf"}, content=content, headers=headers
+        )
+
+    assert denied.status_code == 401
+    assert uploaded.status_code == 200
+    result = uploaded.json()
+    saved_path = model_directory / "local.gguf"
+    assert result["path"] == str(saved_path.resolve())
+    assert result["name"] == "local.gguf"
+    assert result["size_bytes"] == len(content)
+    assert saved_path.read_bytes() == content
+
+
+@pytest.mark.asyncio
+async def test_model_file_upload_rejects_unsafe_names_and_non_gguf_data(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("CORTEX_MODELS_DIR", str(tmp_path / "models"))
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    headers = {**admin_headers(), "Content-Type": "application/octet-stream"}
+
+    async with open_client(app) as client:
+        unsafe_name = await client.post(
+            "/admin/api/models/files/upload",
+            params={"filename": "../escape.gguf"},
+            content=b"GGUF fixture",
+            headers=headers,
+        )
+        invalid_header = await client.post(
+            "/admin/api/models/files/upload",
+            params={"filename": "not-a-model.gguf"},
+            content=b"not a gguf model",
+            headers=headers,
+        )
+
+    assert unsafe_name.status_code == 400
+    assert unsafe_name.json()["error"]["code"] == "invalid_model_filename"
+    assert invalid_header.status_code == 422
+    assert invalid_header.json()["error"]["code"] == "invalid_gguf_file"
+    assert list((tmp_path / "models").glob("*.gguf")) == []
+    assert list((tmp_path / "models").glob("*.partial")) == []
+
+
+@pytest.mark.asyncio
+async def test_model_file_upload_avoids_overwriting_same_named_model(tmp_path, monkeypatch) -> None:
+    model_directory = tmp_path / "models"
+    monkeypatch.setenv("CORTEX_MODELS_DIR", str(model_directory))
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    headers = {**admin_headers(), "Content-Type": "application/octet-stream"}
+
+    async with open_client(app) as client:
+        first = await client.post(
+            "/admin/api/models/files/upload",
+            params={"filename": "same.gguf"},
+            content=b"GGUF first model",
+            headers=headers,
+        )
+        second = await client.post(
+            "/admin/api/models/files/upload",
+            params={"filename": "same.gguf"},
+            content=b"GGUF second model",
+            headers=headers,
+        )
+
+    assert first.status_code == second.status_code == 200
+    assert first.json()["name"] == "same.gguf"
+    assert second.json()["name"] == "same (2).gguf"
+    assert (model_directory / "same.gguf").read_bytes() == b"GGUF first model"
+    assert (model_directory / "same (2).gguf").read_bytes() == b"GGUF second model"
 
 
 @pytest.mark.asyncio

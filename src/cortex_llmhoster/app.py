@@ -48,7 +48,7 @@ from .dashboard import (
     test_model,
     update_config,
 )
-from .dashboard_models import detect_model_capabilities_route, model_files
+from .dashboard_models import detect_model_capabilities_route, model_files, upload_model_file
 from .responses import OrjsonResponse
 from .responses import error_response as _error
 from .runtime import LocalRuntimeManager, automatic_threads, detect_hardware
@@ -1233,6 +1233,7 @@ def create_app(
         Route("/admin/api/config/export", download_config, methods=["GET"]),
         Route("/admin/api/models/test", test_model, methods=["POST"]),
         Route("/admin/api/models/files", model_files, methods=["GET"]),
+        Route("/admin/api/models/files/upload", upload_model_file, methods=["POST"]),
         Route(
             "/admin/api/models/detect-capabilities",
             detect_model_capabilities_route,
