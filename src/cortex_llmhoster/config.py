@@ -21,6 +21,33 @@ class ConfigurationError(ValueError):
 
 LOCAL_RUNTIMES = frozenset({"llama.cpp", "command"})
 DEFAULT_CAPABILITIES = ("text_generation",)
+OPTIMIZATION_PRESETS = frozenset(
+    {
+        "low_minus",
+        "low_plus",
+        "balanced",
+        "medium_minus",
+        "medium_plus",
+        "high_minus",
+        "high_plus",
+        "ultra",
+    }
+)
+_OPTIMIZATION_PRESET_ALIASES = {
+    "low-": "low_minus",
+    "low−": "low_minus",
+    "low+": "low_plus",
+    "balanced_auto": "balanced",
+    "balanced[auto]": "balanced",
+    "balanced (auto)": "balanced",
+    "medium-": "medium_minus",
+    "medium−": "medium_minus",
+    "medium+": "medium_plus",
+    "high-": "high_minus",
+    "high−": "high_minus",
+    "high+": "high_plus",
+    "ultra": "ultra",
+}
 _COMMAND_PLACEHOLDERS = frozenset(
     {
         "model_path",
@@ -122,6 +149,7 @@ class ModelConfig:
     embedding: bool = False
     mmproj_path: str | None = None
     optimization_level: int = 0
+    optimization_preset: str | None = None
 
     @property
     def effective_capabilities(self) -> tuple[str, ...]:
@@ -321,6 +349,31 @@ class Settings:
             if optimization_level not in {-1, 0, 1}:
                 raise ConfigurationError(f"{prefix}.optimization_level must be -1, 0, or 1.")
 
+            raw_preset = row.get("optimization_preset")
+            if raw_preset is None:
+                optimization_preset = {-1: "high_plus", 0: "balanced", 1: "ultra"}[
+                    optimization_level
+                ]
+            elif not isinstance(raw_preset, str):
+                raise ConfigurationError(f"{prefix}.optimization_preset must be a preset name.")
+            else:
+                normalized_preset = raw_preset.strip().lower()
+                optimization_preset = _OPTIMIZATION_PRESET_ALIASES.get(
+                    normalized_preset, normalized_preset
+                )
+                if optimization_preset not in OPTIMIZATION_PRESETS:
+                    allowed = ", ".join(sorted(OPTIMIZATION_PRESETS - {"ultra"}))
+                    raise ConfigurationError(
+                        f"{prefix}.optimization_preset must be one of {allowed}, or ultra."
+                    )
+                optimization_level = (
+                    1
+                    if optimization_preset == "ultra"
+                    else -1
+                    if optimization_preset in {"high_minus", "high_plus"}
+                    else 0
+                )
+
             model_path = row.get("model_path")
             if model_path is not None and (
                 not isinstance(model_path, str) or not model_path.strip()
@@ -467,6 +520,7 @@ class Settings:
                 upstream_model=upstream_model,
                 runtime=runtime,
                 optimization_level=optimization_level,
+                optimization_preset=optimization_preset,
                 model_path=model_path,
                 capabilities=tuple(capabilities),
                 runtime_command=runtime_command,

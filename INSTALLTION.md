@@ -204,7 +204,7 @@ context_size = 2048
 batch_size = 256
 ubatch_size = 64
 parallel = 1
-optimization_level = -1 # -1 Efficient, 0 Balanced, 1 ULTRA
+optimization_preset = "balanced" # low_minus, low_plus, balanced, medium_minus, medium_plus, high_minus, high_plus
 ```
 
 On Windows, forward slashes are accepted for paths, for example:
@@ -215,10 +215,11 @@ On Windows, forward slashes are accepted for paths, for example:
 - CPU-only: `gpu_layers = 0`, `parallel = 1`, and a moderate context size.
 - GPU: try `gpu_layers = -1` only if the selected build supports your GPU and it
   has enough VRAM; lower the layer count if the model does not start.
-- Low memory: choose optimization level `-1` (Efficient), reduce
-  `context_size`, `batch_size`, and `ubatch_size`, and stop other models.
-- ULTRA (`optimization_level = 1`) can use more scratch memory; it is not a
-  universal speed switch. See the [tuning guide](README.md#cpu-and-gpu-tuning).
+- If unsure, use `optimization_preset = "balanced"`. Lower modes favor
+  quality/prompt throughput and can use more memory; higher modes trade some
+  cache precision for lower memory use.
+- ULTRA is an optional, more aggressive tune and may use more scratch memory.
+  It is not a guaranteed speed switch. See the [tuning guide](README.md#cpu-and-gpu-tuning).
 
 ## 5. Start Cortex
 
@@ -229,8 +230,8 @@ non-empty API key or configured account username turns authentication on by
 default. Whenever authentication is enabled, a non-empty `CORTEX_API_KEY` is
 required; account credentials add a dashboard login method but do not replace
 the key. To explicitly disable authentication and run without a key, use
-`--no-api-auth` or set `CORTEX_API_AUTH_ENABLED=false`; requests are then open,
-so only do this on a trusted local listener.
+`--no-auth` (alias `--no-api-auth`) or set `CORTEX_API_AUTH_ENABLED=false`.
+Requests are then open, so only do this on a trusted local listener.
 
 ### Linux / macOS
 
@@ -278,9 +279,10 @@ API clients continue using bearer keys. The default model starts automatically;
 use **Models** to add, check, start, stop, or edit other local models.
 
 To run without any authentication or API key, remove/unset `CORTEX_API_KEY`
-from the environment and start with `python -m cortex_llmhoster --no-api-auth`, or set
-`CORTEX_API_AUTH_ENABLED=false`. This allows anonymous access to dashboard and
-inference APIs; use only on a trusted local listener. When authentication is
+from the environment and start with `python -m cortex_llmhoster --no-auth`
+(`--no-api-auth` remains supported), or set `CORTEX_API_AUTH_ENABLED=false`.
+This allows anonymous access to dashboard and inference APIs; use only on a
+trusted local listener. When authentication is
 enabled, a non-empty `CORTEX_API_KEY` is required; missing keys produce a clear
 configuration error even if admin account variables are configured.
 

@@ -9,7 +9,13 @@ import httpx
 import orjson
 import pytest
 
-from cortex_llmhoster.app import _request_timeout, _response_headers, create_app
+from cortex_llmhoster.app import (
+    _missing_capabilities,
+    _request_timeout,
+    _required_capabilities,
+    _response_headers,
+    create_app,
+)
 from cortex_llmhoster.config import ModelConfig, Settings
 
 
@@ -38,6 +44,42 @@ def test_response_headers_filter_standard_and_connection_nominated_hop_headers()
         "content-type": "application/json",
         "x-visible": "keep",
     }
+
+
+@pytest.mark.parametrize(
+    ("route_path", "declared", "required"),
+    [
+        ("chat/completions", "llm", "text_generation"),
+        ("text-to-text", "t2t", "text_generation"),
+        ("images/generations", "text_to_image", "image_generation"),
+        ("images/edits", "image_to_image", "image_generation"),
+        ("audio/transcriptions", "asr", "audio_transcription"),
+        ("audio/speech", "text_to_speech", "audio_generation"),
+        ("videos/generations", "image_to_video", "video_generation"),
+        ("videos/understanding", "video_to_text", "video_understanding"),
+        ("ocr/parse", "document_ocr", "ocr"),
+        ("embeddings", "text_embedding", "embeddings"),
+        ("moderations", "content_moderation", "moderation"),
+    ],
+)
+def test_specific_task_ids_satisfy_existing_endpoint_capabilities(
+    route_path: str, declared: str, required: str
+) -> None:
+    required_capabilities = _required_capabilities(route_path, None)
+
+    assert required_capabilities == {required}
+    assert not _missing_capabilities(required_capabilities, frozenset({declared}))
+
+
+def test_custom_task_ids_can_gate_matching_local_runtime_paths() -> None:
+    route_path = "extensions/speech-translation"
+    declared = frozenset({"extensions_speech_translation"})
+
+    assert _required_capabilities(route_path, None, declared) == {"extensions_speech_translation"}
+    assert _required_capabilities(route_path, None) == set()
+    assert not _missing_capabilities(
+        {"extensions_speech_translation"}, frozenset({"extensions/speech-translation"})
+    )
 
 
 @pytest.mark.asyncio
@@ -168,6 +210,84 @@ async def test_chat_request_is_routed_and_alias_is_rewritten() -> None:
     assert observed["url"] == "http://127.0.0.1:12345/v1/chat/completions"
     assert observed["auth"] is None
     assert observed["organization"] == "team-a"
+    assert observed["body"]["model"] == "runtime-model"  # type: ignore[index]
+
+
+@pytest.mark.parametrize(
+    ("route_path", "declared_capability"),
+    [
+        ("text-to-text", "t2t"),
+        ("text-to-image", "t2i"),
+        ("text_to_image", "t2i"),
+        ("image-to-image", "i2i"),
+        ("text-to-video", "t2v"),
+        ("image-to-video", "i2v"),
+        ("video-to-video", "v2v"),
+        ("speech-to-text", "asr"),
+        ("text-to-speech", "tts"),
+        ("image-to-text", "vlm"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_task_specific_routes_forward_through_the_selected_local_runtime(
+    route_path: str, declared_capability: str
+) -> None:
+    observed: dict[str, object] = {}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        observed["path"] = request.url.path
+        observed["body"] = orjson.loads(await request.aread())
+        return httpx.Response(200, json={"ok": True})
+
+    settings = Settings(
+        models={
+            "public-name": ModelConfig(
+                id="public-name",
+                upstream_model="runtime-model",
+                model_path="/models/test.gguf",
+                capabilities=(declared_capability,),
+            )
+        },
+        default_model="public-name",
+    )
+    app = create_app(settings, transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        response = await client.post(
+            f"/v1/{route_path}",
+            json={"model": "public-name", "input": "local task request"},
+        )
+
+    assert response.status_code == 200
+    assert observed["path"] == f"/v1/{route_path}"
+    assert observed["body"]["model"] == "runtime-model"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+async def test_declared_custom_task_path_is_checked_and_receives_the_runtime_model_alias() -> None:
+    observed: dict[str, object] = {}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        observed["body"] = orjson.loads(await request.aread())
+        return httpx.Response(200, json={"ok": True})
+
+    settings = Settings(
+        models={
+            "public-name": ModelConfig(
+                id="public-name",
+                upstream_model="runtime-model",
+                model_path="/models/test.gguf",
+                capabilities=("extensions_speech_translation",),
+            )
+        },
+        default_model="public-name",
+    )
+    app = create_app(settings, transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/extensions/speech-translation", json={"input": "audio"}
+        )
+
+    assert response.status_code == 200
     assert observed["body"]["model"] == "runtime-model"  # type: ignore[index]
 
 

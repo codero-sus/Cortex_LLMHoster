@@ -19,7 +19,7 @@ from typing import Any
 
 import httpx
 
-from .config import LOCAL_RUNTIMES, ModelConfig, Settings
+from .config import LOCAL_RUNTIMES, OPTIMIZATION_PRESETS, ModelConfig, Settings
 from .python_runtime import resolve_python_executable
 
 
@@ -77,22 +77,48 @@ def build_llama_command(
         raise ValueError("Local llama.cpp models require model_path.")
     threads = model.threads or automatic_threads(cpu_count)
     threads_batch = model.threads_batch or threads
-    optimization_level = model.optimization_level
-    ultra = optimization_level == 1
-    if optimization_level == -1:
-        batch_size = min(model.batch_size, 128)
-        ubatch_size = min(model.ubatch_size, batch_size, 32)
-    elif ultra:
-        batch_size = max(model.batch_size, 512)
-        ubatch_size = min(batch_size, max(model.ubatch_size, 128))
-    else:
-        batch_size = model.batch_size
-        ubatch_size = model.ubatch_size
+    preset = model.optimization_preset
+    if preset not in OPTIMIZATION_PRESETS:
+        preset = {-1: "high_plus", 0: "balanced", 1: "ultra"}.get(
+            model.optimization_level, "balanced"
+        )
+    batch_size = model.batch_size
+    ubatch_size = model.ubatch_size
+    cache_type_k = model.cache_type_k
+    cache_type_v = model.cache_type_v
     flash_attn = model.flash_attn
-    if ultra and model.gpu_layers != 0 and flash_attn == "auto":
-        flash_attn = "on"
-    cache_type_k = "q8_0" if ultra else model.cache_type_k
-    cache_type_v = "q8_0" if ultra else model.cache_type_v
+    if preset == "low_minus":
+        batch_size = max(batch_size, 1024)
+        ubatch_size = min(batch_size, max(ubatch_size, 256))
+        cache_type_k = cache_type_v = "f16"
+    elif preset == "low_plus":
+        batch_size = max(batch_size, 768)
+        ubatch_size = min(batch_size, max(ubatch_size, 192))
+        cache_type_k = cache_type_v = "f16"
+    elif preset == "balanced":
+        pass
+    elif preset == "medium_minus":
+        batch_size = max(batch_size, 384)
+        ubatch_size = min(batch_size, max(ubatch_size, 96))
+        cache_type_k = cache_type_v = "f16"
+    elif preset == "medium_plus":
+        batch_size = max(batch_size, 384)
+        ubatch_size = min(batch_size, max(ubatch_size, 96))
+        cache_type_k = cache_type_v = "q8_0"
+    elif preset == "high_minus":
+        batch_size = min(batch_size, 256)
+        ubatch_size = min(ubatch_size, batch_size, 64)
+        cache_type_k = cache_type_v = "q8_0"
+    elif preset == "high_plus":
+        batch_size = min(batch_size, 128)
+        ubatch_size = min(ubatch_size, batch_size, 32)
+        cache_type_k = cache_type_v = "q8_0"
+    elif preset == "ultra":
+        batch_size = max(batch_size, 512)
+        ubatch_size = min(batch_size, max(ubatch_size, 128))
+        cache_type_k = cache_type_v = "q8_0"
+        if model.gpu_layers != 0 and flash_attn == "auto":
+            flash_attn = "on"
     args = [
         binary,
         "--model",

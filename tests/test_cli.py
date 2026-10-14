@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import sys
 
+import pytest
 import uvicorn
 
 from cortex_llmhoster import cli
@@ -48,7 +49,8 @@ workers = 2
     assert os.environ["CORTEX_WORKERS"] == "3"
 
 
-def test_cli_no_api_auth_flag_runs_without_a_key(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("flag", ["--no-api-auth", "--no-auth"])
+def test_cli_no_api_auth_flag_runs_without_a_key(flag, tmp_path, monkeypatch) -> None:
     monkeypatch.setattr(cli.python_runtime, "_project_root", lambda: tmp_path)
     monkeypatch.setattr(cli, "reexec_with_selected_python", lambda: None)
     monkeypatch.setenv("CORTEX_API_AUTH_ENABLED", "true")
@@ -65,7 +67,7 @@ def test_cli_no_api_auth_flag_runs_without_a_key(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(cli.Settings, "load", load_settings)
     monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: observed.update(kwargs))
-    monkeypatch.setattr(sys, "argv", ["cortex-llmhoster", "--no-api-auth"])
+    monkeypatch.setattr(sys, "argv", ["cortex-llmhoster", flag])
 
     cli.main()
 

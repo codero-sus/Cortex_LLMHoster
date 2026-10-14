@@ -121,6 +121,52 @@ async def test_local_model_is_managed_and_served_through_cortex(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_stop_all_models_stops_managed_runtimes_concurrently(tmp_path, monkeypatch) -> None:
+    models = {
+        model_id: ModelConfig(
+            id=model_id,
+            upstream_model=model_id,
+            model_path=f"/models/{model_id}.gguf",
+        )
+        for model_id in ("first", "second")
+    }
+    app = create_app(
+        Settings(
+            models=models,
+            default_model="first",
+            api_key="dashboard-secret",
+        ),
+        admin_config_path=tmp_path / "cortex.local.json",
+    )
+    async with open_client(app) as client:
+        manager = app.state.runtime_manager
+        active = 0
+        peak_active = 0
+        stopped: list[str] = []
+
+        async def fake_stop(model_id: str) -> dict[str, str]:
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            stopped.append(model_id)
+            return {"id": model_id, "status": "stopped"}
+
+        monkeypatch.setattr(manager, "stop", fake_stop)
+        response = await client.post(
+            "/admin/api/models/stop-all",
+            headers={"Authorization": "Bearer dashboard-secret"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        assert set(response.json()["stopped"]) == {"first", "second"}
+        assert set(stopped) == {"first", "second"}
+        assert peak_active == 2
+
+
+@pytest.mark.asyncio
 async def test_command_runtime_serves_openai_compatible_modality_end_to_end(tmp_path: Path) -> None:
     backend = tmp_path / "openai_local_backend.py"
     backend.write_text(

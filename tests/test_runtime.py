@@ -87,41 +87,92 @@ def test_build_llama_command_uses_args_and_local_low_memory_options() -> None:
     assert command[command.index("--mmproj") + 1] == "/models/projector.gguf"
 
 
-def test_optimization_levels_tune_cpu_and_gpu_commands_without_forcing_device_mode() -> None:
-    efficient_model = local_model(optimization_level=-1, gpu_layers=0)
-    efficient_command = build_llama_command("/opt/llama-server", efficient_model, 8765, cpu_count=4)
-    assert efficient_command[efficient_command.index("--batch-size") + 1] == "128"
-    assert efficient_command[efficient_command.index("--ubatch-size") + 1] == "32"
-    assert efficient_command[efficient_command.index("--cache-type-k") + 1] == "f16"
+def test_optimization_presets_balance_quality_and_memory_modes() -> None:
+    low = build_llama_command(
+        "/opt/llama-server", local_model(optimization_preset="low_minus"), 8765, cpu_count=4
+    )
+    assert low[low.index("--batch-size") + 1] == "1024"
+    assert low[low.index("--ubatch-size") + 1] == "256"
+    assert low[low.index("--cache-type-k") + 1] == "f16"
 
-    cpu_model = local_model(optimization_level=1, gpu_layers=0)
+    low_plus = build_llama_command(
+        "/opt/llama-server", local_model(optimization_preset="low_plus"), 8765, cpu_count=4
+    )
+    assert low_plus[low_plus.index("--batch-size") + 1] == "768"
+    assert low_plus[low_plus.index("--cache-type-v") + 1] == "f16"
+
+    balanced = build_llama_command(
+        "/opt/llama-server",
+        local_model(optimization_level=1, optimization_preset="balanced"),
+        8765,
+        cpu_count=4,
+    )
+    assert balanced[balanced.index("--batch-size") + 1] == "256"
+    assert balanced[balanced.index("--ubatch-size") + 1] == "64"
+    assert balanced[balanced.index("--cache-type-k") + 1] == "f16"
+
+    medium_minus = build_llama_command(
+        "/opt/llama-server", local_model(optimization_preset="medium_minus"), 8765, cpu_count=4
+    )
+    medium_plus = build_llama_command(
+        "/opt/llama-server", local_model(optimization_preset="medium_plus"), 8765, cpu_count=4
+    )
+    assert medium_minus[medium_minus.index("--batch-size") + 1] == "384"
+    assert medium_minus[medium_minus.index("--cache-type-k") + 1] == "f16"
+    assert medium_plus[medium_plus.index("--batch-size") + 1] == "384"
+    assert medium_plus[medium_plus.index("--cache-type-k") + 1] == "q8_0"
+
+    high_minus = build_llama_command(
+        "/opt/llama-server", local_model(optimization_preset="high_minus"), 8765, cpu_count=4
+    )
+    high_plus = build_llama_command(
+        "/opt/llama-server", local_model(optimization_preset="high_plus"), 8765, cpu_count=4
+    )
+    assert high_minus[high_minus.index("--batch-size") + 1] == "256"
+    assert high_minus[high_minus.index("--cache-type-k") + 1] == "q8_0"
+    assert high_plus[high_plus.index("--batch-size") + 1] == "128"
+    assert high_plus[high_plus.index("--ubatch-size") + 1] == "32"
+    assert high_plus[high_plus.index("--cache-type-v") + 1] == "q8_0"
+
+
+def test_ultra_is_opt_in_and_legacy_levels_are_mapped() -> None:
+    cpu_model = local_model(optimization_level=1)
     cpu_command = build_llama_command("/opt/llama-server", cpu_model, 8765, cpu_count=4)
-
-    assert cpu_command[cpu_command.index("--n-gpu-layers") + 1] == "0"
+    assert cpu_command[cpu_command.index("--n-gpu-layers") + 1] == "-1"
     assert cpu_command[cpu_command.index("--batch-size") + 1] == "512"
     assert cpu_command[cpu_command.index("--ubatch-size") + 1] == "128"
     assert cpu_command[cpu_command.index("--cache-type-k") + 1] == "q8_0"
-    assert cpu_command[cpu_command.index("--cache-type-v") + 1] == "q8_0"
-    assert cpu_command[cpu_command.index("--flash-attn") + 1] == "auto"
 
-    gpu_model = local_model(optimization_level=1, gpu_layers=-1, flash_attn="auto")
-    gpu_command = build_llama_command("/opt/llama-server", gpu_model, 8765, cpu_count=4)
-    assert gpu_command[gpu_command.index("--n-gpu-layers") + 1] == "-1"
+    gpu_command = build_llama_command(
+        "/opt/llama-server",
+        local_model(optimization_preset="ultra", gpu_layers=4, flash_attn="auto"),
+        8765,
+        cpu_count=4,
+    )
+    assert gpu_command[gpu_command.index("--n-gpu-layers") + 1] == "4"
     assert gpu_command[gpu_command.index("--flash-attn") + 1] == "on"
 
-    compatible_override = local_model(
-        optimization_level=1,
-        gpu_layers=4,
-        flash_attn="off",
-        batch_size=1024,
-        ubatch_size=256,
-    )
     override_command = build_llama_command(
-        "/opt/llama-server", compatible_override, 8765, cpu_count=4
+        "/opt/llama-server",
+        local_model(
+            optimization_preset="ultra",
+            gpu_layers=0,
+            flash_attn="off",
+            batch_size=1024,
+            ubatch_size=256,
+        ),
+        8765,
+        cpu_count=4,
     )
     assert override_command[override_command.index("--flash-attn") + 1] == "off"
     assert override_command[override_command.index("--batch-size") + 1] == "1024"
     assert override_command[override_command.index("--ubatch-size") + 1] == "256"
+
+    legacy_efficient = build_llama_command(
+        "/opt/llama-server", local_model(optimization_level=-1), 8765, cpu_count=4
+    )
+    assert legacy_efficient[legacy_efficient.index("--batch-size") + 1] == "128"
+    assert legacy_efficient[legacy_efficient.index("--cache-type-k") + 1] == "q8_0"
 
 
 def test_local_model_config_accepts_gguf_cpu_and_gpu_controls() -> None:
@@ -151,6 +202,7 @@ def test_local_model_config_accepts_gguf_cpu_and_gpu_controls() -> None:
     assert settings.default_model == "tiny-local"
     assert model.runtime == "llama.cpp"
     assert model.optimization_level == 1
+    assert model.optimization_preset == "ultra"
     assert model.gpu_layers == -1
     assert model.embedding is True
     assert model.mmproj_path == "/models/projector.gguf"

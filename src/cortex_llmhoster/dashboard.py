@@ -13,6 +13,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import orjson
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, Response
@@ -27,7 +28,7 @@ from .auth import (
     verify_admin_credentials,
 )
 from .config import LOCAL_RUNTIMES, ConfigurationError, ModelConfig, Settings
-from .cookbook import cookbook_models
+from .cookbook import HF_TASK_LABELS, cookbook_models, search_hugging_face
 from .responses import OrjsonResponse
 from .responses import error_response as _error
 from .updater import UpdateError, check_for_updates, install_from_commit
@@ -170,6 +171,7 @@ def _public_settings(settings: Settings) -> dict[str, Any]:
                 "api_base_path": model.api_base_path,
                 "health_path": model.health_path,
                 "optimization_level": model.optimization_level,
+                "optimization_preset": model.optimization_preset,
                 "model_path": model.model_path,
                 "threads": model.threads,
                 "threads_batch": model.threads_batch,
@@ -206,6 +208,7 @@ def _persistable_settings(settings: Settings) -> dict[str, Any]:
             "api_base_path": model.api_base_path,
             "health_path": model.health_path,
             "optimization_level": model.optimization_level,
+            "optimization_preset": model.optimization_preset,
             "model_path": model.model_path,
             "threads": model.threads,
             "threads_batch": model.threads_batch,
@@ -304,6 +307,7 @@ def _candidate_settings(payload: Any, current: Settings) -> Settings:
                 "optimization_level": raw_model.get(
                     "optimization_level", raw_model.get("optimization_profile", 0)
                 ),
+                "optimization_preset": raw_model.get("optimization_preset"),
                 "model_path": raw_model.get("model_path"),
                 "threads": raw_model.get("threads", 0),
                 "threads_batch": raw_model.get("threads_batch", 0),
@@ -516,12 +520,74 @@ async def model_cookbook(request: Request) -> Response:
     auth = _admin_auth(request, request.app.state.settings)
     if auth is not None:
         return auth
-    return OrjsonResponse(
-        {
-            "models": cookbook_models(),
-            "source": "Curated public Hugging Face model cards; Cortex makes no Hub API calls.",
-        }
-    )
+
+    params = request.query_params
+    source = params.get("source", "curated")
+    if source == "curated":
+        return OrjsonResponse(
+            {
+                "models": cookbook_models(),
+                "source": "Curated offline list; no Hub API calls are made in this view.",
+                "live": False,
+                "next_cursor": None,
+            }
+        )
+    if source != "huggingface":
+        return _error("source must be 'curated' or 'huggingface'.", status_code=400)
+
+    query = params.get("q", "").strip()
+    task = params.get("task", "").strip()
+    file_format = params.get("format", "gguf").strip().lower()
+    sort = params.get("sort", "downloads").strip().lower()
+    cursor = params.get("cursor", "")
+    if len(query) > 120 or any(ord(character) < 32 for character in query):
+        return _error("Search text must be at most 120 printable characters.", status_code=400)
+    if task and task not in HF_TASK_LABELS:
+        return _error("Choose a supported Hugging Face task filter.", status_code=400)
+    if file_format not in {"all", "gguf"}:
+        return _error("format must be 'all' or 'gguf'.", status_code=400)
+    if sort not in {"updated", "downloads", "likes"}:
+        return _error("sort must be 'downloads', 'likes', or 'updated'.", status_code=400)
+    if len(cursor) > 1024 or any(ord(character) < 32 for character in cursor):
+        return _error("Invalid Hugging Face pagination cursor.", status_code=400)
+
+    cache_key = (query, task, file_format, sort, cursor)
+    now = time.monotonic()
+    cache = getattr(request.app.state, "hf_cookbook_cache", {})
+    request.app.state.hf_cookbook_cache = cache
+    cached = cache.get(cache_key)
+    if cached and cached[0] > now:
+        return OrjsonResponse(cached[1])
+
+    try:
+        models, next_cursor = await search_hugging_face(
+            request.app.state.http_client,
+            query=query,
+            task=task,
+            file_format=file_format,
+            sort=sort,
+            cursor=cursor,
+        )
+    except (httpx.HTTPError, TypeError, ValueError):
+        return _error(
+            "Live Hugging Face search is unavailable. Try again or switch to the curated offline list.",
+            status_code=503,
+            error_type="server_error",
+            code="cookbook_hub_unavailable",
+        )
+
+    result = {
+        "models": models,
+        "next_cursor": next_cursor,
+        "live": True,
+        "source": "Hugging Face public model metadata · cached for 5 minutes · weights are not downloaded.",
+    }
+    cache[cache_key] = (now + 300.0, result)
+    if len(cache) > 64:
+        expired_keys = sorted(cache, key=lambda key: cache[key][0])[: len(cache) - 64]
+        for expired_key in expired_keys:
+            cache.pop(expired_key, None)
+    return OrjsonResponse(result)
 
 
 async def admin_state(request: Request) -> Response:
@@ -785,6 +851,45 @@ async def stop_model(request: Request) -> Response:
 
 async def restart_model(request: Request) -> Response:
     return await runtime_action(request, "restart")
+
+
+async def stop_all_models(request: Request) -> Response:
+    auth = _admin_auth(request, request.app.state.settings)
+    if auth is not None:
+        return auth
+    async with request.app.state.admin_lock:
+        settings: Settings = request.app.state.settings
+        model_ids = [
+            model_id
+            for model_id, model in settings.models.items()
+            if model.runtime in LOCAL_RUNTIMES
+        ]
+        manager = request.app.state.runtime_manager
+        results = await asyncio.gather(
+            *(manager.stop(model_id) for model_id in model_ids), return_exceptions=True
+        )
+        model_states: dict[str, dict[str, Any]] = {}
+        for model_id, result in zip(model_ids, results, strict=True):
+            if isinstance(result, BaseException):
+                model_states[model_id] = {
+                    "id": model_id,
+                    "status": "error",
+                    "error": str(result),
+                }
+            else:
+                model_states[model_id] = result
+        states = list(model_states.values())
+    return OrjsonResponse(
+        {
+            "ok": all(state.get("status") == "stopped" for state in states),
+            "stopped": [
+                model_id
+                for model_id, state in model_states.items()
+                if state.get("status") == "stopped"
+            ],
+            "models": model_states,
+        }
+    )
 
 
 async def test_model(request: Request) -> Response:
