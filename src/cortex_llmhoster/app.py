@@ -43,10 +43,12 @@ from .dashboard import (
     restart_model,
     runtime_status,
     start_model,
+    stop_all_models,
     stop_model,
     test_model,
     update_config,
 )
+from .dashboard_models import detect_model_capabilities_route, model_files
 from .responses import OrjsonResponse
 from .responses import error_response as _error
 from .runtime import LocalRuntimeManager, automatic_threads, detect_hardware
@@ -187,17 +189,77 @@ _MODEL_BODY_ENDPOINTS = frozenset(
         "images/generations",
         "images/variations",
         "moderations",
+        "moderation",
+        "content-moderation",
+        "reranking",
+        "reranker",
         "ocr",
         "ocr/parse",
         "responses",
         "rerank",
         "audio/analysis",
+        "audio-to-text",
+        "audio-to-audio",
+        "audio-understanding",
+        "audio-generation",
+        "audio-perception",
+        "audio-classification",
+        "audio-translation",
+        "automatic-speech-recognition",
+        "speech-recognition",
         "video/analysis",
         "video/generations",
         "video/understanding",
         "videos/analysis",
         "videos/generations",
         "videos/understanding",
+        "image-to-image",
+        "image-to-text",
+        "text-to-image",
+        "text-to-text",
+        "text-to-video",
+        "image-to-video",
+        "video-to-text",
+        "video-to-video",
+        "video-summarization",
+        "video-captioning",
+        "video-generation",
+        "video-understanding",
+        "image-understanding",
+        "vision-understanding",
+        "vision",
+        "llm",
+        "text-generation",
+        "audio-transcription",
+        "image-generation",
+        "object-detection",
+        "image-segmentation",
+        "visual-question-answering",
+        "depth-estimation",
+        "image-captioning",
+        "image-classification",
+        "text-recognition",
+        "document-ocr",
+        "text-summarization",
+        "text-translation",
+        "text-classification",
+        "text-embedding",
+        "image-embedding",
+        "image-editing",
+        "speech-to-text",
+        "text-to-audio",
+        "text-to-speech",
+        "speech-to-speech",
+        "t2t",
+        "t2i",
+        "i2i",
+        "t2v",
+        "i2v",
+        "v2v",
+        "stt",
+        "tts",
+        "asr",
+        "vlm",
     }
 )
 
@@ -220,7 +282,186 @@ _ENDPOINT_CAPABILITIES = {
     "ocr": "ocr",
     "ocr/parse": "ocr",
     "audio/analysis": "audio_understanding",
+    "audio-perception": "audio_understanding",
+    "audio-classification": "audio_understanding",
+    "audio-generation": "audio_generation",
+    "audio-to-text": "audio_transcription",
+    "audio-translation": "audio_transcription",
+    "automatic-speech-recognition": "audio_transcription",
+    "speech-recognition": "audio_transcription",
+    "text-generation": "text_generation",
+    "llm": "text_generation",
+    "vision": "vision_understanding",
+    "vision-understanding": "vision_understanding",
+    "object-detection": "vision_understanding",
+    "image-segmentation": "vision_understanding",
+    "visual-question-answering": "vision_understanding",
+    "depth-estimation": "vision_understanding",
+    "video-generation": "video_generation",
+    "video-understanding": "video_understanding",
+    "moderation": "moderation",
+    "content-moderation": "moderation",
+    "reranking": "reranking",
+    "reranker": "reranking",
+    "audio-transcription": "audio_transcription",
+    "audio-understanding": "audio_understanding",
+    "audio-to-audio": "audio_generation",
+    "image-to-image": "image_generation",
+    "image-to-text": "vision_understanding",
+    "text-to-image": "image_generation",
+    "text-to-text": "text_generation",
+    "text-to-video": "video_generation",
+    "image-to-video": "video_generation",
+    "video-to-text": "video_understanding",
+    "video-to-video": "video_generation",
+    "video-summarization": "video_understanding",
+    "video-captioning": "video_understanding",
+    "image-understanding": "vision_understanding",
+    "image-captioning": "vision_understanding",
+    "image-classification": "vision_understanding",
+    "text-recognition": "ocr",
+    "document-ocr": "ocr",
+    "text-summarization": "text_generation",
+    "text-translation": "text_generation",
+    "text-classification": "text_generation",
+    "text-embedding": "embeddings",
+    "image-embedding": "embeddings",
+    "image-generation": "image_generation",
+    "image-editing": "image_generation",
+    "speech-to-text": "audio_transcription",
+    "text-to-audio": "audio_generation",
+    "text-to-speech": "audio_generation",
+    "speech-to-speech": "audio_generation",
+    "t2t": "text_generation",
+    "t2i": "image_generation",
+    "i2i": "image_generation",
+    "t2v": "video_generation",
+    "i2v": "video_generation",
+    "v2v": "video_generation",
+    "stt": "audio_transcription",
+    "tts": "audio_generation",
+    "asr": "audio_transcription",
+    "vlm": "vision_understanding",
 }
+
+_CAPABILITY_ALTERNATIVES = {
+    "text_generation": frozenset(
+        {
+            "text_generation",
+            "text_to_text",
+            "llm",
+            "language_model",
+            "chat",
+            "completion",
+            "t2t",
+            "text_summarization",
+            "text_translation",
+            "text_classification",
+        }
+    ),
+    "vision_understanding": frozenset(
+        {
+            "vision_understanding",
+            "vision",
+            "vlm",
+            "image_understanding",
+            "image_to_text",
+            "image_captioning",
+            "image_classification",
+            "object_detection",
+            "image_segmentation",
+            "visual_question_answering",
+            "depth_estimation",
+        }
+    ),
+    "ocr": frozenset({"ocr", "text_recognition", "document_ocr"}),
+    "image_generation": frozenset(
+        {
+            "image_generation",
+            "text_to_image",
+            "image_to_image",
+            "image_editing",
+            "t2i",
+            "i2i",
+        }
+    ),
+    "audio_transcription": frozenset(
+        {
+            "audio_transcription",
+            "speech_to_text",
+            "audio_to_text",
+            "audio_translation",
+            "automatic_speech_recognition",
+            "speech_recognition",
+            "asr",
+            "stt",
+        }
+    ),
+    "audio_understanding": frozenset(
+        {
+            "audio_understanding",
+            "audio_perception",
+            "audio_classification",
+            "sound_classification",
+            "speech_to_text",
+            "audio_to_text",
+            "asr",
+            "stt",
+        }
+    ),
+    "audio_generation": frozenset(
+        {
+            "audio_generation",
+            "text_to_speech",
+            "speech_generation",
+            "speech_synthesis",
+            "speech_to_speech",
+            "audio_to_audio",
+            "music_generation",
+            "tts",
+        }
+    ),
+    "video_understanding": frozenset(
+        {
+            "video_understanding",
+            "video_to_text",
+            "video_summarization",
+            "video_captioning",
+            "video_question_answering",
+            "video_classification",
+            "action_recognition",
+        }
+    ),
+    "video_generation": frozenset(
+        {
+            "video_generation",
+            "text_to_video",
+            "image_to_video",
+            "video_to_video",
+            "t2v",
+            "i2v",
+            "v2v",
+        }
+    ),
+    "embeddings": frozenset(
+        {"embeddings", "text_embedding", "image_embedding", "feature_extraction"}
+    ),
+    "reranking": frozenset({"reranking", "reranker"}),
+    "moderation": frozenset({"moderation", "content_moderation"}),
+}
+
+
+def _missing_capabilities(required: set[str], available: frozenset[str]) -> set[str]:
+    normalized_available = {
+        capability.replace("/", "_").replace("-", "_") for capability in available
+    }
+    return {
+        capability
+        for capability in required
+        if not (
+            _CAPABILITY_ALTERNATIVES.get(capability, frozenset({capability})) & normalized_available
+        )
+    }
 
 
 def _message_capabilities(value: object) -> set[str]:
@@ -245,12 +486,14 @@ def _message_capabilities(value: object) -> set[str]:
                 found.add("audio_understanding")
             elif normalized_key in {"video", "video_url", "videos", "input_video"}:
                 found.add("video_understanding")
-            elif (
-                normalized_key == "modalities"
-                and isinstance(nested, list)
-                and any(str(item).lower() == "audio" for item in nested)
-            ):
-                found.add("audio_generation")
+            elif normalized_key in {"modalities", "output_modalities"} and isinstance(nested, list):
+                modalities = {str(item).lower() for item in nested}
+                if "audio" in modalities:
+                    found.add("audio_generation")
+                if "image" in modalities:
+                    found.add("image_generation")
+                if "video" in modalities:
+                    found.add("video_generation")
             found.update(_message_capabilities(nested))
     elif isinstance(value, list):
         for item in value:
@@ -266,9 +509,15 @@ def _message_capabilities(value: object) -> set[str]:
     return found
 
 
-def _required_capabilities(route_path: str, body: dict[str, object] | None) -> set[str]:
+def _required_capabilities(
+    route_path: str,
+    body: dict[str, object] | None,
+    declared_capabilities: frozenset[str] = frozenset(),
+) -> set[str]:
     normalized_path = route_path.strip("/").lower()
     required = _ENDPOINT_CAPABILITIES.get(normalized_path)
+    if required is None:
+        required = _ENDPOINT_CAPABILITIES.get(normalized_path.replace("_", "-"))
     if required is not None:
         return {required}
     if normalized_path in {"chat/completions", "completions", "responses"}:
@@ -276,6 +525,9 @@ def _required_capabilities(route_path: str, body: dict[str, object] | None) -> s
         return detected or {"text_generation"}
     if normalized_path.startswith("ocr/"):
         return {"ocr"}
+    custom_capability = normalized_path.replace("-", "_").replace("/", "_")
+    if custom_capability in declared_capabilities:
+        return {custom_capability}
     return set()
 
 
@@ -564,8 +816,8 @@ async def inference(request: Request) -> Response:
         assert model is not None
 
         route_path = request.path_params.get("path", "").strip("/")
-        required_capabilities = _required_capabilities(route_path, json_body)
-        missing_capabilities = required_capabilities - model.capability_set
+        required_capabilities = _required_capabilities(route_path, json_body, model.capability_set)
+        missing_capabilities = _missing_capabilities(required_capabilities, model.capability_set)
         if missing_capabilities:
             missing = ", ".join(sorted(missing_capabilities))
             available = ", ".join(model.effective_capabilities) or "none declared"
@@ -578,7 +830,9 @@ async def inference(request: Request) -> Response:
                 param="model",
             )
 
-        should_inject_model = route_path in _MODEL_BODY_ENDPOINTS and body_model is None
+        should_inject_model = body_model is None and (
+            route_path in _MODEL_BODY_ENDPOINTS or bool(required_capabilities)
+        )
         should_rewrite_model = body_model is not None and body_model != model.upstream_model
         if json_body is not None and (should_inject_model or should_rewrite_model):
             rewritten = dict(json_body)
@@ -978,9 +1232,16 @@ def create_app(
         Route("/admin/api/config/reset", reset_config, methods=["POST"]),
         Route("/admin/api/config/export", download_config, methods=["GET"]),
         Route("/admin/api/models/test", test_model, methods=["POST"]),
+        Route("/admin/api/models/files", model_files, methods=["GET"]),
+        Route(
+            "/admin/api/models/detect-capabilities",
+            detect_model_capabilities_route,
+            methods=["POST"],
+        ),
         Route("/admin/api/runtime", runtime_status, methods=["GET"]),
         Route("/admin/api/models/start", start_model, methods=["POST"]),
         Route("/admin/api/models/stop", stop_model, methods=["POST"]),
+        Route("/admin/api/models/stop-all", stop_all_models, methods=["POST"]),
         Route("/admin/api/models/restart", restart_model, methods=["POST"]),
         Route("/health", health, methods=["GET"]),
         Route("/ready", readiness, methods=["GET"]),

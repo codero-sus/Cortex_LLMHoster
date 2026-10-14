@@ -28,6 +28,8 @@ def main() -> None:
     parser.add_argument("--api-config", help="OpenAI-compatible API route config JSON.")
     parser.add_argument(
         "--no-api-auth",
+        "--no-auth",
+        dest="no_api_auth",
         action="store_true",
         help="Run without API/dashboard authentication; no API key is required.",
     )

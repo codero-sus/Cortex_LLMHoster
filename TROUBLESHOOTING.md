@@ -104,9 +104,10 @@ The OS/model runtime and model weights are installed separately.
    `gpu_layers` count if VRAM is the limit. `-1` requests maximum available
    offload; it does not guarantee that every layer fits.
 3. Reduce `context_size` first, then reduce `batch_size` and `ubatch_size`.
-4. Keep `parallel = 1` on low-memory hosts and choose optimization level `-1`
-   (Efficient). ULTRA (`1`) increases some batch/cache settings and can require
-   more RAM/VRAM.
+4. Keep `parallel = 1` on low-memory hosts. In the Models editor, a higher
+   mode such as High+ uses smaller batches and a quantized KV cache to aim for
+   lower memory use; quantized caches can affect output quality. ULTRA is
+   optional and may use more scratch RAM/VRAM.
 5. Ensure the model quantization and the model's required memory fit your
    hardware. Cortex cannot reduce the memory footprint of incompatible weights.
 
@@ -143,10 +144,10 @@ own machine; Cortex does not promise a specific tokens-per-second rate.
   project-root `.env`. If no account is configured, the login form defaults to
   key mode; enter the exact local key without quotes or the `Bearer ` prefix.
 - To run without a key and without authentication, remove/unset
-  `CORTEX_API_KEY`, then launch with `python -m cortex_llmhoster --no-api-auth`
-  or set
-  `CORTEX_API_AUTH_ENABLED=false`. This opens dashboard and inference APIs, so
-  only use it on a trusted local listener.
+  `CORTEX_API_KEY`, then launch with `python -m cortex_llmhoster --no-auth`
+  (`--no-api-auth` remains supported) or set `CORTEX_API_AUTH_ENABLED=false`.
+  This opens dashboard and inference APIs, so only use it on a trusted local
+  listener.
 - Successful sign-in creates a signed 30-day HttpOnly cookie; passwords and API
   keys are not stored in browser storage or the cookie. API clients can continue
   sending `Authorization: Bearer <key>`.

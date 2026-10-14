@@ -162,12 +162,37 @@ async def test_dashboard_is_served_and_auth_enabled_requires_key(tmp_path) -> No
     assert "https://github.com/codero-sus" in page.text
     assert "https://the-codero.web.app/" in page.text
     assert "Chat playground" in page.text
-    assert "ULTRA (+1)" in page.text
+    assert "Use ULTRA tuning (optional)" in page.text
+    assert "Choose supported tasks (optional)" in page.text
+    assert 'id="model-file-select"' in page.text
+    assert "Choose a local GGUF file" in page.text
+    assert 'id="manual-model-path-toggle"' in page.text
+    assert "Enter a model path manually" in page.text
+    assert "/admin/api/models/files" in page.text
+    assert "Auto-detect tasks" in page.text
+    assert "/admin/api/models/detect-capabilities" in page.text
+    assert 'data-page="docs"' in page.text
+    assert "Cortex LLMHoster Docs" in page.text
+    assert "2PY2=/absolute/path/to/python3.12" in page.text
+    assert 'name="capability_choice"' in page.text
+    assert 'name="custom_capabilities"' in page.text
+    assert "Text-to-image · T2I" in page.text
+    assert "Image-to-video · I2V" in page.text
+    assert "Speech-to-speech" in page.text
+    assert "Search models" in page.text
+    assert "Make default" in page.text
+    assert "stop-all-models" in page.text
+    assert "Balanced (Auto)" in page.text
+    for mode in ("Low−", "Low+", "Medium−", "Medium+", "High−", "High+"):
+        assert mode in page.text
     assert "{python}" in page.text
     assert 'aria-labelledby="dialog-title"' in page.text
     assert "Local admin username" in page.text
     assert "Use API key instead" in page.text
     assert "Authentication-enabled mode requires a local API key." in page.text
+    assert "No-auth mode (use instead of setting CORTEX_API_KEY)" in page.text
+    assert "--no-auth" in page.text
+    assert "When off, no API key or login is required" in page.text
     assert 'placeholder="Local API key"' in page.text
     assert "requestAnimationFrame" in page.text
     assert "setAttribute('aria-current','page')" in page.text
@@ -334,7 +359,7 @@ async def test_auth_toggle_persists_without_writing_the_local_secret(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_model_cookbook_is_a_static_searchable_catalog(tmp_path) -> None:
+async def test_model_cookbook_curated_offline_catalog_remains_available(tmp_path) -> None:
     app = create_app(Settings(), admin_config_path=tmp_path / "config.json")
     async with open_client(app) as client:
         response = await client.get("/admin/api/cookbook")
@@ -345,6 +370,99 @@ async def test_model_cookbook_is_a_static_searchable_catalog(tmp_path) -> None:
     assert "no Hub API calls" in payload["source"]
     assert all(model["repo"] and model["task"] and model["format"] for model in payload["models"])
     assert all("/" in model["repo"] for model in payload["models"])
+
+
+@pytest.mark.asyncio
+async def test_live_hugging_face_catalog_filters_caches_and_paginates(tmp_path) -> None:
+    received: list[httpx.Request] = []
+
+    async def hub_response(request: httpx.Request) -> httpx.Response:
+        received.append(request)
+        if request.url.params.get("cursor") == "page-2":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "community/llama-3b-GGUF",
+                        "pipeline_tag": "text-generation",
+                        "library_name": "gguf",
+                        "tags": ["gguf", "3b"],
+                        "downloads": 20,
+                        "likes": 3,
+                    }
+                ],
+            )
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "community/llama-8b-GGUF",
+                    "pipeline_tag": "text-generation",
+                    "library_name": "gguf",
+                    "tags": ["gguf", "8b", "license:apache-2.0"],
+                    "downloads": 1500,
+                    "likes": 45,
+                    "cardData": {"description": "A public local model."},
+                }
+            ],
+            headers={"Link": '<https://huggingface.co/api/models?cursor=page-2>; rel="next"'},
+        )
+
+    app = create_app(
+        Settings(),
+        transport=httpx.MockTransport(hub_response),
+        admin_config_path=tmp_path / "config.json",
+    )
+    query = (
+        "/admin/api/cookbook?source=huggingface&q=llama&task=text-generation"
+        "&format=gguf&sort=downloads"
+    )
+    async with open_client(app) as client:
+        first = await client.get(query)
+        cached = await client.get(query)
+        next_page = await client.get(f"{query}&cursor=page-2")
+
+    assert first.status_code == 200
+    assert first.json()["live"] is True
+    assert first.json()["models"][0]["repo"] == "community/llama-8b-GGUF"
+    assert first.json()["models"][0]["scale"] == "8B"
+    assert first.json()["models"][0]["license"] == "apache-2.0"
+    assert first.json()["next_cursor"] == "page-2"
+    assert cached.json() == first.json()
+    assert next_page.status_code == 200
+    assert next_page.json()["models"][0]["repo"] == "community/llama-3b-GGUF"
+    assert len(received) == 2
+    assert received[0].url.host == "huggingface.co"
+    assert received[0].url.params["search"] == "llama"
+    assert received[0].url.params["pipeline_tag"] == "text-generation"
+    assert received[0].url.params["filter"] == "gguf"
+
+
+@pytest.mark.asyncio
+async def test_live_hugging_face_catalog_is_bounded_and_has_offline_fallback(tmp_path) -> None:
+    async def hub_unavailable(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(503)
+
+    app = create_app(
+        Settings(),
+        transport=httpx.MockTransport(hub_unavailable),
+        admin_config_path=tmp_path / "config.json",
+    )
+    async with open_client(app) as client:
+        invalid_task = await client.get(
+            "/admin/api/cookbook?source=huggingface&task=not-a-task"
+        )
+        long_query = await client.get(f"/admin/api/cookbook?source=huggingface&q={'x' * 121}")
+        unavailable = await client.get("/admin/api/cookbook?source=huggingface")
+        curated = await client.get("/admin/api/cookbook?source=curated")
+
+    assert invalid_task.status_code == 400
+    assert long_query.status_code == 400
+    assert unavailable.status_code == 503
+    assert unavailable.json()["error"]["code"] == "cookbook_hub_unavailable"
+    assert curated.status_code == 200
+    assert curated.json()["live"] is False
+    assert len(curated.json()["models"]) >= 45
 
 
 @pytest.mark.asyncio
@@ -445,6 +563,7 @@ async def test_local_model_fields_round_trip_through_dashboard(tmp_path) -> None
                 "id": "tiny-local",
                 "runtime": "llama.cpp",
                 "optimization_level": 1,
+                "optimization_preset": "medium_plus",
                 "model_path": "/models/tiny-q4.gguf",
                 "mmproj_path": "/models/projector.gguf",
                 "gpu_layers": -1,
@@ -466,7 +585,8 @@ async def test_local_model_fields_round_trip_through_dashboard(tmp_path) -> None
     assert saved.status_code == 200
     local_model = state.json()["models"][0]
     assert local_model["runtime"] == "llama.cpp"
-    assert local_model["optimization_level"] == 1
+    assert local_model["optimization_level"] == 0
+    assert local_model["optimization_preset"] == "medium_plus"
     assert local_model["gpu_layers"] == -1
     assert local_model["context_size"] == 1024
     assert local_model["embedding"] is True
@@ -474,10 +594,12 @@ async def test_local_model_fields_round_trip_through_dashboard(tmp_path) -> None
     assert state.json()["runtime"]["models"]["tiny-local"]["status"] == "error"
     stored_config = json.loads(local_config.read_text(encoding="utf-8"))
     assert "dashboard-secret" not in json.dumps(stored_config)
-    assert stored_config["models"][0]["optimization_level"] == 1
+    assert stored_config["models"][0]["optimization_level"] == 0
+    assert stored_config["models"][0]["optimization_preset"] == "medium_plus"
     assert exported.status_code == 200
     assert exported.json()["models"][0]["runtime"] == "llama.cpp"
-    assert exported.json()["models"][0]["optimization_level"] == 1
+    assert exported.json()["models"][0]["optimization_level"] == 0
+    assert exported.json()["models"][0]["optimization_preset"] == "medium_plus"
     assert exported.json()["models"][0]["embedding"] is True
 
 
@@ -620,3 +742,53 @@ async def test_command_runtime_capabilities_and_argv_round_trip_through_dashboar
         "video_generation",
         "ocr",
     ]
+
+
+@pytest.mark.asyncio
+async def test_model_file_picker_requires_admin_auth_and_lists_local_gguf_files(
+    tmp_path, monkeypatch
+) -> None:
+    model_directory = tmp_path / "models"
+    model_directory.mkdir()
+    model_file = model_directory / "nomic-embed-text-v1.5.Q4_K_M.gguf"
+    model_file.write_bytes(b"GGUF local model fixture")
+    monkeypatch.setenv("CORTEX_MODELS_DIR", str(model_directory))
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+
+    async with open_client(app) as client:
+        denied = await client.get("/admin/api/models/files")
+        response = await client.get("/admin/api/models/files", headers=admin_headers())
+
+    assert denied.status_code == 401
+    assert response.status_code == 200
+    assert response.json()["files"] == [
+        {
+            "path": str(model_file),
+            "name": model_file.name,
+            "size_bytes": model_file.stat().st_size,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_capability_detection_suggests_tasks_from_local_gguf_metadata(tmp_path) -> None:
+    model_file = tmp_path / "llava-vision-instruct.Q4_K_M.gguf"
+    model_file.write_bytes(b"GGUF general.architecture=llava vision instruct")
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+
+    async with open_client(app) as client:
+        denied = await client.post(
+            "/admin/api/models/detect-capabilities", json={"model_path": str(model_file)}
+        )
+        response = await client.post(
+            "/admin/api/models/detect-capabilities",
+            headers=admin_headers(),
+            json={"model_path": str(model_file), "model_id": "local-vision"},
+        )
+
+    assert denied.status_code == 401
+    assert response.status_code == 200
+    assert {"vision_understanding", "text_generation"}.issubset(
+        response.json()["capabilities"]
+    )
+    assert "best-effort" in response.json()["note"].lower()

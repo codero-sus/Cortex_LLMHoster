@@ -212,6 +212,72 @@ def test_invalid_optimization_level_is_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("low-", "low_minus"),
+        ("low−", "low_minus"),
+        ("low+", "low_plus"),
+        ("balanced[auto]", "balanced"),
+        ("medium-", "medium_minus"),
+        ("medium−", "medium_minus"),
+        ("medium+", "medium_plus"),
+        ("high-", "high_minus"),
+        ("high−", "high_minus"),
+        ("high+", "high_plus"),
+        ("ultra", "ultra"),
+    ],
+)
+def test_optimization_preset_names_and_aliases(configured: str, expected: str) -> None:
+    settings = Settings.from_mapping(
+        {
+            "models": [
+                {
+                    "id": "local",
+                    "model_path": "/models/local.gguf",
+                    "optimization_preset": configured,
+                }
+            ]
+        },
+        environ={},
+    )
+
+    assert settings.models["local"].optimization_preset == expected
+
+
+def test_legacy_optimization_levels_map_to_named_presets() -> None:
+    for level, expected in [(-1, "high_plus"), (0, "balanced"), (1, "ultra")]:
+        settings = Settings.from_mapping(
+            {
+                "models": [
+                    {
+                        "id": "local",
+                        "model_path": "/models/local.gguf",
+                        "optimization_level": level,
+                    }
+                ]
+            },
+            environ={},
+        )
+        assert settings.models["local"].optimization_preset == expected
+
+
+def test_invalid_optimization_preset_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="optimization_preset must"):
+        Settings.from_mapping(
+            {
+                "models": [
+                    {
+                        "id": "local",
+                        "model_path": "/models/local.gguf",
+                        "optimization_preset": "fastest-ever",
+                    }
+                ]
+            },
+            environ={},
+        )
+
+
 def test_local_model_path_must_be_gguf(tmp_path) -> None:
     with pytest.raises(ConfigurationError, match="must point to a GGUF file"):
         Settings.from_mapping(

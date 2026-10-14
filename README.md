@@ -11,10 +11,10 @@ explicitly turns local API protection on or off. Authentication defaults on
 when a non-empty `CORTEX_API_KEY` or dashboard account username is configured;
 when enabled, a non-empty local `CORTEX_API_KEY` is required. A configured
 username/password adds account sign-in to the dashboard but does not replace the
-API key. Use `CORTEX_API_AUTH_ENABLED=false` or `--no-api-auth` to run without a
-key and allow unauthenticated local requests. The API key is a **local bearer
-secret**, not a provider credential, and Cortex does not forward it to a model
-runtime. Successful dashboard sign-in creates a signed, persistent, HttpOnly
+API key. Use `CORTEX_API_AUTH_ENABLED=false` or `--no-auth` (alias
+`--no-api-auth`) to run without a key and allow unauthenticated local requests.
+The API key is a **local bearer secret**, not a provider credential, and Cortex
+does not forward it to a model runtime. Successful dashboard sign-in creates a signed, persistent, HttpOnly
 session cookie for 30 days; API clients can continue to use the bearer key.
 Cortex has no per-token cloud charge. You still
 need a computer, local runtime, model weights, and any required third-party
@@ -29,9 +29,9 @@ incompatible APIs.
 
 Efficiency controls include CPU-only operation, optional GPU offload, quantized
 GGUF model support, memory mapping, configurable context and batches, KV-cache
-tuning, and three optimization levels. Actual speed and memory use depend on the
-model, quantization, runtime build, and hardware; Cortex makes no unmeasured
-benchmark claims.
+tuning, and seven selectable optimization modes, with ULTRA as a separate opt-in.
+Actual speed and memory use depend on the model, quantization, runtime build, and
+hardware; Cortex makes no unmeasured benchmark claims.
 
 ## License and permitted use
 
@@ -54,10 +54,12 @@ Visit the [project website](https://the-codero.web.app/) for more from Codero-Su
 - **Two local runtime modes:** first-class llama.cpp/GGUF hosting plus a
   supervised command adapter for any local engine that exposes OpenAI-compatible
   HTTP endpoints.
-- **Task/capability registry:** declare text generation, vision understanding,
-  OCR, audio understanding/transcription/generation, image generation, video
-  understanding/generation, embeddings, reranking, or future task labels per
-  model. Unsupported declared tasks get a clear API error.
+- **Task/capability registry:** choose common text, vision/VLM, OCR, image,
+  audio, video, embeddings, reranking, and moderation tasks in the grouped model
+  form, or enter custom task IDs. Known routes accept both broad capabilities
+  and specific aliases such as LLM/T2T, T2I/I2I, ASR/STT/TTS, and T2V/I2V/V2V.
+  Capability labels describe the selected local model/runtime; they do not add
+  missing implementations.
 - **Multimodal request transport:** supports JSON chat/responses and bounded
   multipart media uploads, including OpenAI-style audio transcription requests.
   Image, audio, video, OCR, and generation endpoints are passed to the matching
@@ -80,8 +82,9 @@ Visit the [project website](https://the-codero.web.app/) for more from Codero-Su
   clients may continue to authenticate with the local bearer key.
 - **Lightweight browser UI:** manage models, runtimes and task declarations;
   inspect hardware; chat; use a same-origin modality/API workbench; browse a
-  searchable static Hugging Face model cookbook; and import/export secret-free
-  configuration. The cookbook requires no Hub API, HF account, or token.
+  paginated Hugging Face model cookbook with an offline curated fallback; and
+  import/export secret-free configuration. Public search sends no HF token and
+  downloads no model weights.
 - **OpenAI-compatible API:** routes chat, completions, responses, embeddings,
   image/audio/video endpoints, and backend-defined paths to the selected local
   process. A route is usable only when that backend implements it.
@@ -129,10 +132,10 @@ account credentials. Authentication-enabled mode always requires
 `CORTEX_API_KEY`; configure account credentials too if you want account-based
 dashboard sign-in alongside bearer-key access. To run without an API key, unset
 it from the environment and disable authentication, for example:
-`unset CORTEX_API_KEY && python -m cortex_llmhoster --no-api-auth`, or set
-`CORTEX_API_AUTH_ENABLED=false` (also available as `api_auth_enabled = false`
-under `[server]` in `cortex.toml`). Anonymous access should only be used on a
-trusted local listener. Cortex binds to `127.0.0.1` by default; model inference
+`unset CORTEX_API_KEY && python -m cortex_llmhoster --no-auth` (the older
+`--no-api-auth` flag remains supported), or set `CORTEX_API_AUTH_ENABLED=false`
+(also available as `api_auth_enabled = false` under `[server]` in `cortex.toml`).
+Anonymous access should only be used on a trusted local listener. Cortex binds to `127.0.0.1` by default; model inference
 stays on your computer. The software is free to use only within the personal,
 non-commercial terms in [`LICENSE`](LICENSE).
 
@@ -215,23 +218,34 @@ selected interpreter described above. Use a local server/wrapper that implements
 the desired endpoints and a health path returning HTTP 2xx. `model_path` may be a
 file or directory and is optional if the runtime command does not need it.
 
-Common capability-to-route checks are:
+The dashboard's **Models** form has grouped task checkboxes and a custom task-ID
+field. Capability names are normalized to lowercase underscore IDs (hyphens are
+accepted). The built-in route checks accept either the broad capability names
+or appropriate task-specific aliases:
 
-| Capability | Cortex API paths |
+| Route capability | Example accepted aliases |
 | --- | --- |
-| `text_generation` | `/chat/completions`, `/completions`, text-only `/responses` |
-| `vision_understanding` | Image-containing `/chat/completions` and `/responses` |
-| `ocr` | `/ocr` and `/ocr/parse` (local backend-defined endpoint) |
-| `audio_transcription` | `/audio/transcriptions`, `/audio/translations` (multipart supported) |
-| `audio_understanding` | Audio-input chat/responses and `/audio/analysis` |
-| `audio_generation` | `/audio/speech` and audio-output chat/responses |
-| `image_generation` | `/images/generations`, `/images/edits`, `/images/variations` |
-| `video_understanding` | Video-input chat/responses and `/videos/understanding` |
-| `video_generation` | `/videos/generations` and `/video/generations` |
-| `embeddings`, `reranking`, `moderation` | `/embeddings`, `/rerank`, `/moderations` |
+| `text_generation` | `text_to_text`, `llm`, `language_model`, `t2t`, `text_summarization`, `text_translation` |
+| `vision_understanding` | `vision`, `vlm`, `image_understanding`, `image_to_text`, `image_captioning`, `visual_question_answering` |
+| `ocr` | `text_recognition`, `document_ocr` |
+| `image_generation` | `text_to_image` / `t2i`, `image_to_image` / `i2i`, `image_editing` |
+| `audio_transcription` | `speech_to_text`, `audio_to_text`, `asr`, `stt`, `audio_translation` |
+| `audio_understanding` | `audio_perception`, `audio_classification`, `asr`, `stt` |
+| `audio_generation` | `text_to_speech` / `tts`, `speech_generation`, `speech_to_speech`, `music_generation` |
+| `video_understanding` | `video_to_text`, `video_summarization`, `video_captioning`, `action_recognition` |
+| `video_generation` | `text_to_video` / `t2v`, `image_to_video` / `i2v`, `video_to_video` / `v2v` |
+| `embeddings`, `reranking`, `moderation` | `text_embedding`, `image_embedding`, `feature_extraction`, `reranker`, `content_moderation` |
+
+The standard routes listed above also have task-oriented path aliases, including
+`/text-to-text`, `/text-to-image`, `/image-to-image`, `/image-to-text`,
+`/speech-to-text`, `/text-to-speech`, `/text-to-video`, `/image-to-video`, and
+`/video-to-video`. They are forwarded unchanged to the selected local runtime.
 
 Unknown backend-specific `/v1/*` paths are also passed through, so additional
-tasks can be added without changing the Cortex route dispatcher. Declare
+tasks can be added without changing the Cortex route dispatcher. If a custom
+capability ID matches an unknown route after converting its slashes and hyphens
+to underscores (for example, `extensions_speech_translation` for
+`/extensions/speech-translation`), Cortex checks that declaration too. Declare
 capabilities as lowercase underscore task labels. For llama.cpp, text generation
 is the default; `embedding = true` enables embeddings, and `mmproj_path` adds
 vision understanding for compatible GGUF models. Configure a modality-specific
@@ -251,7 +265,8 @@ controls:
 | Setting | Purpose |
 | --- | --- |
 | `gpu_layers` | `0` for CPU-only; `-1` for maximum supported GPU offload; positive values offload that many layers. |
-| `optimization_level` | `-1` caps batches at 128/32 for lower memory; `0` uses configured tuning; `1` is ULTRA (batch minima 512/128, q8_0 KV cache, and GPU Flash Attention when set to `auto`). Device selection remains explicit through `gpu_layers`. |
+| `optimization_preset` | `low_minus`, `low_plus`, `balanced`, `medium_minus`, `medium_plus`, `high_minus`, or `high_plus`; optional `ultra` enables the separate ULTRA tune. Lower modes keep F16 KV cache and use larger prompt batches; higher modes use Q8_0 KV cache and smaller batches to aim for lower memory use. |
+| `optimization_level` | Legacy setting (`-1` Efficient, `0` Balanced, `1` ULTRA); new configurations should use `optimization_preset`. |
 | `threads` / `threads_batch` | CPU inference and prompt-processing threads; `0` selects a conservative, container-aware automatic count. CPU affinity/quota detection is cached for the process lifetime. |
 | `context_size` | Context window in tokens. Reducing it lowers KV-cache memory use. |
 | `batch_size` / `ubatch_size` | Prompt-processing batch limits; smaller values can reduce peak memory. |
@@ -268,15 +283,19 @@ a modest `context_size` (for example 1024–2048), and smaller batch sizes. For 
 GPU build, try `gpu_layers = -1`, then lower the offload count if VRAM is
 insufficient. These are starting points, not universal performance guarantees.
 
-The model editor provides three optimization levels: `-1` (Efficient), `0`
-(Balanced), and `1` (ULTRA). Efficient caps batch/micro-batch sizes at 128/32;
-Balanced uses the configured values; ULTRA raises their minimums to 512/128,
-uses q8_0 KV caches, and enables Flash Attention for GPU offload when set to
-`auto`. The levels do not change `gpu_layers` or auto-select an accelerator.
-ULTRA can need more scratch RAM/VRAM, q8_0 may affect output quality, and an
-unsupported llama.cpp build may reject its options. These are hardware-dependent
-presets, not measured throughput claims. Older `optimization_profile =
-"balanced"` / `"ultra"` config values remain accepted as levels 0 / 1.
+The simplified model editor asks for one of seven standard modes when you add
+a llama.cpp model: Low− (`low_minus`), Low+ (`low_plus`), Balanced (Auto)
+(`balanced`), Medium− (`medium_minus`), Medium+ (`medium_plus`), High−
+(`high_minus`), or High+ (`high_plus`). Lower modes keep an F16 KV cache and
+use larger prompt batches to favor quality and prompt throughput, at higher
+memory cost. Higher modes use a Q8_0 KV cache and smaller batches to favor lower
+memory use; quantized caches can affect output quality. `balanced` keeps the
+model's configured tuning. **ULTRA is an optional opt-in** that applies the
+existing larger-batch/Q8_0 tune and enables GPU Flash Attention when available.
+If ULTRA is off, the editor requires a standard mode before saving. Modes do not
+auto-select a GPU, and none guarantees a particular speed or output quality;
+results depend on the model, runtime, and hardware. Legacy `optimization_level`
+values and `optimization_profile = "balanced"` / `"ultra"` remain supported.
 
 Cortex also bounds active inference requests (`max_inference_requests`; default
 8, and never above `max_connections`) before the inference handler parses
@@ -309,8 +328,10 @@ other dialects require an explicit adapter and are not silently translated.
 The dashboard at `/` includes:
 
 - Host CPU/RAM/GPU snapshot and local runtime status.
-- Add/edit/remove model configuration, task capabilities, local start/stop/restart,
-  and runtime process output.
+- Search configured models; add/edit/remove them, switch the default directly
+  from a model card, and view runtime process output.
+- Start/stop/restart individual runtimes or stop all loaded local models in one
+  action to unload their weights and free process memory.
 - A streaming text chat playground and a local API/media workbench.
 - llama.cpp tuning, API settings, request metrics, and secret-free config
   import/export.
@@ -333,11 +354,15 @@ off removes the dashboard cookie and allows admin and inference API access
 without credentials, so only do this on a trusted local listener. Changing the
 API key or either account credential revokes existing dashboard sessions.
 
-The **Model cookbook** is a bundled static catalog of public Hugging Face
-repository links with task/format filters. It makes no Hugging Face API requests
-and does not require an HF login or token to browse. Repository access and files
-can change; check each model card's license, usage conditions, quantization,
-format, and local runtime compatibility before downloading or using a model.
+The **Model cookbook** searches the public Hugging Face model registry live and
+loads results in pages of 30. Search by model/author, filter by task or GGUF
+format, and sort by downloads, likes, or update time. Results are metadata only;
+Cortex does not download model weights or send an HF token. Search text and
+filters are sent to Hugging Face, and responses are cached in memory for five
+minutes. A curated offline catalog is available if the Hub is unreachable.
+Repository access and files can change; check each model card's license, usage
+conditions, quantization, format, and local runtime compatibility before using
+a model.
 
 ### Useful environment variables
 
@@ -359,10 +384,11 @@ format, and local runtime compatibility before downloading or using a model.
 | `CORTEX_MAX_INFERENCE_REQUESTS` | Up to `8` | Active inference body/stream limit, capped by `max_connections`; excess requests receive HTTP 503 with `Retry-After`. |
 
 CLI options `--host`, `--port`, `--workers`, `--log-level`, and
-`--access-log` override their TOML/environment values. `--no-api-auth` disables
-all API/dashboard authentication, allowing a keyless open local server;
-`--api-config` selects the OpenAI-compatible route config JSON. For locally managed
-models, `--workers` must resolve to `1` to avoid duplicate model processes.
+`--access-log` override their TOML/environment values. `--no-auth` (alias
+`--no-api-auth`) disables all API/dashboard authentication, allowing a keyless
+open local server; `--api-config` selects the OpenAI-compatible route config
+JSON. For locally managed models, `--workers` must resolve to `1` to avoid
+duplicate model processes.
 
 ## Endpoints
 
@@ -374,15 +400,19 @@ models, `--workers` must resolve to `1` to avoid duplicate model processes.
   routes implemented by each selected local runtime.
 - `/v1/audio/*`, `/v1/images/*`, `/v1/videos/*`, `/v1/ocr` — multimodal or
   backend-defined routes; availability depends on that model's runtime.
+- `/v1/text-to-*`, `/v1/image-to-*`, `/v1/video-to-*`, and speech task aliases —
+  task-oriented paths forwarded unchanged to the configured local runtime.
 - `GET /admin/api/auth/options` — public non-secret login-capability flags used
   to choose account or API-key mode in the sign-in form.
 - `/admin/api/auth/login` and `/admin/api/auth/logout` — dashboard session
   creation/removal; login verifies configured local admin credentials or the
   local API key and issues/removes the signed cookie.
 - `/admin/api/state`, `/admin/api/cookbook`, and other `/admin/api/*` routes —
-  settings, the static model catalog, runtime controls, process logs, and
-  per-worker metrics. They accept the session cookie or a bearer key when auth is
-  enabled, and no key when auth is disabled.
+  settings, runtime controls, process logs, and per-worker metrics. The cookbook
+  accepts `source=huggingface` plus `q`, `task`, `format`, `sort`, and `cursor`
+  parameters for paginated Hub search; `source=curated` selects its offline list.
+  These routes accept the session cookie or a bearer key when auth is enabled,
+  and no key when auth is disabled.
 
 ## Maintainer test commands
 

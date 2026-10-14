@@ -1,6 +1,12 @@
-"""Static, public Hugging Face model-cookbook entries; no Hub API is used."""
+"""Public Hugging Face Hub search plus an offline curated model cookbook."""
 
 from __future__ import annotations
+
+import re
+from collections.abc import Mapping
+from typing import Any
+
+import httpx
 
 # These are hand-curated repository links, not a live Hugging Face query. Model
 # availability, file formats, licenses, and access terms can change; check each
@@ -75,3 +81,143 @@ def cookbook_models() -> list[dict[str, str]]:
         }
         for name, repo, task, model_format, scale, summary in _RAW_MODELS
     ]
+
+HF_MODEL_API_URL = "https://huggingface.co/api/models"
+HF_TASK_LABELS: dict[str, str] = {
+    "text-generation": "Text generation",
+    "conversational": "Chat / conversational",
+    "image-text-to-text": "Vision-language",
+    "image-to-text": "Image captioning",
+    "text-to-image": "Image generation",
+    "automatic-speech-recognition": "Audio transcription",
+    "text-to-speech": "Audio generation",
+    "feature-extraction": "Embeddings / features",
+    "sentence-similarity": "Embeddings / similarity",
+    "text-classification": "Text classification",
+    "token-classification": "Token classification",
+    "image-classification": "Image classification",
+    "object-detection": "Object detection",
+    "visual-question-answering": "Visual Q&A",
+    "document-question-answering": "Document Q&A",
+    "video-classification": "Video",
+    "depth-estimation": "Depth estimation",
+    "zero-shot-classification": "Zero-shot classification",
+}
+
+
+def _hf_scale(repo: str, tags: list[str]) -> str:
+    text = f"{repo} {' '.join(tags)}"
+    match = re.search(r"(?i)(?:^|[-_ /])([0-9]+(?:\.[0-9]+)?)[-_ ]?(b|m)(?:$|[-_ /])", text)
+    return f"{match.group(1)}{match.group(2).upper()}" if match else "—"
+
+
+def _hf_format(row: Mapping[str, Any], tags: list[str]) -> str:
+    library = row.get("library_name")
+    library = library if isinstance(library, str) else ""
+    if library.casefold() == "gguf" or "gguf" in {tag.casefold() for tag in tags}:
+        return "GGUF"
+    display_names = {
+        "transformers": "Transformers",
+        "diffusers": "Diffusers",
+        "sentence-transformers": "Sentence Transformers",
+    }
+    return display_names.get(library.casefold(), library or "Model files")
+
+
+def _normalize_hf_model(row: object) -> dict[str, Any] | None:
+    if not isinstance(row, Mapping):
+        return None
+    repo = row.get("id")
+    if (
+        not isinstance(repo, str)
+        or not repo.strip()
+        or len(repo) > 200
+        or "\\" in repo
+        or any(segment in {".", ".."} for segment in repo.split("/"))
+    ):
+        return None
+    raw_tags = row.get("tags", [])
+    tags = [tag for tag in raw_tags if isinstance(tag, str)] if isinstance(raw_tags, list) else []
+    raw_task = row.get("pipeline_tag")
+    task_key = raw_task if isinstance(raw_task, str) else ""
+    task = HF_TASK_LABELS.get(task_key, task_key.replace("-", " ").title() if task_key else "Unspecified")
+    card_data = row.get("cardData")
+    description = card_data.get("description") if isinstance(card_data, Mapping) else None
+    downloads = row.get("downloads") if isinstance(row.get("downloads"), int) else 0
+    likes = row.get("likes") if isinstance(row.get("likes"), int) else 0
+    if not isinstance(description, str) or not description.strip():
+        description = f"Public Hugging Face model · {downloads:,} downloads · {likes:,} likes."
+    description = re.sub(r"\s+", " ", description).strip()[:240]
+    license_name = card_data.get("license") if isinstance(card_data, Mapping) else None
+    if not isinstance(license_name, str):
+        license_tag = next((tag.removeprefix("license:") for tag in tags if tag.startswith("license:")), "")
+        license_name = license_tag or "Check model card"
+    last_modified = row.get("lastModified")
+    return {
+        "name": repo.rsplit("/", 1)[-1],
+        "repo": repo,
+        "task": task,
+        "task_key": task_key,
+        "format": _hf_format(row, tags),
+        "scale": _hf_scale(repo, tags),
+        "summary": description,
+        "downloads": downloads,
+        "likes": likes,
+        "license": license_name,
+        "last_modified": last_modified if isinstance(last_modified, str) else "",
+        "tags": tags[:20],
+    }
+
+
+def _next_hf_cursor(response: httpx.Response) -> str | None:
+    next_link = response.links.get("next", {})
+    url = next_link.get("url") if isinstance(next_link, Mapping) else None
+    if not isinstance(url, str):
+        return None
+    try:
+        next_url = httpx.URL(url)
+    except (TypeError, ValueError):
+        return None
+    if next_url.host != "huggingface.co":
+        return None
+    cursor = next_url.params.get("cursor")
+    return cursor if cursor and len(cursor) <= 1024 else None
+
+
+async def search_hugging_face(
+    client: httpx.AsyncClient,
+    *,
+    query: str,
+    task: str,
+    file_format: str,
+    sort: str,
+    cursor: str,
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Fetch one bounded public-model page; never downloads model weights."""
+
+    params: dict[str, str | int] = {
+        "limit": 30,
+        "sort": {"downloads": "downloads", "likes": "likes", "updated": "lastModified"}[sort],
+        "direction": -1,
+        "full": "false",
+    }
+    if query:
+        params["search"] = query
+    if task:
+        params["pipeline_tag"] = task
+    if file_format == "gguf":
+        params["filter"] = "gguf"
+    if cursor:
+        params["cursor"] = cursor
+    response = await client.get(
+        HF_MODEL_API_URL,
+        params=params,
+        headers={"Accept": "application/json", "User-Agent": "Cortex-LLMHoster"},
+        timeout=httpx.Timeout(6.0, connect=2.0),
+    )
+    response.raise_for_status()
+    rows = response.json()
+    if not isinstance(rows, list):
+        raise TypeError("Hugging Face returned an unexpected model-list response.")
+    models = [model for row in rows if (model := _normalize_hf_model(row)) is not None]
+    return models, _next_hf_cursor(response)
