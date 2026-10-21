@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import platform
@@ -19,8 +20,31 @@ from typing import Any
 
 import httpx
 
-from .config import LOCAL_RUNTIMES, OPTIMIZATION_PRESETS, ModelConfig, Settings
-from .python_runtime import resolve_python_executable
+from .config import (
+    CORTEX_CPP_RUNTIME,
+    CORTEX_RUNTIME,
+    LOCAL_RUNTIMES,
+    OPTIMIZATION_PRESETS,
+    ModelConfig,
+    Settings,
+)
+from .native_model import (
+    NativeModelSource,
+    NativeModelSourceError,
+    build_native_conversion_command,
+    cached_native_conversion,
+    converter_script,
+    create_native_conversion_temp_dir,
+    discard_native_conversion_temp,
+    inspect_native_model_source,
+    native_conversion_cache_dir,
+    native_conversion_cache_key,
+    publish_native_conversion,
+    resolve_llama_cpp_source_dir,
+)
+from .python_runtime import PythonInterpreterError, resolve_python_executable
+
+logger = logging.getLogger("cortex_llmhoster.runtime")
 
 
 @lru_cache(maxsize=1)
@@ -119,10 +143,14 @@ def build_llama_command(
         cache_type_k = cache_type_v = "q8_0"
         if model.gpu_layers != 0 and flash_attn == "auto":
             flash_attn = "on"
+    try:
+        resolved_model_path = Path(model.model_path).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Could not resolve local model path: {exc}") from exc
     args = [
         binary,
         "--model",
-        str(Path(model.model_path).expanduser().resolve()),
+        str(resolved_model_path),
         "--alias",
         model.upstream_model,
         "--host",
@@ -157,8 +185,172 @@ def build_llama_command(
     if model.embedding:
         args.append("--embedding")
     if model.mmproj_path:
-        args.extend(("--mmproj", str(Path(model.mmproj_path).expanduser().resolve())))
+        try:
+            projector_path = Path(model.mmproj_path).expanduser().resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"Could not resolve projector path: {exc}") from exc
+        args.extend(("--mmproj", str(projector_path)))
     return args
+
+
+def build_cortex_runtime_command(model: ModelConfig, port: int) -> list[str]:
+    """Launch Cortex's own Python GGUF backend without a llama-server executable."""
+
+    if model.runtime != CORTEX_RUNTIME:
+        raise ValueError("Cortex's built-in backend requires runtime='cortex'.")
+    if not model.model_path:
+        raise ValueError("Cortex's built-in GGUF backend requires model_path.")
+    if model.mmproj_path:
+        raise ValueError("Cortex's built-in GGUF backend does not support projector files.")
+    try:
+        model_path = Path(model.model_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Could not resolve local model path: {exc}") from exc
+    if not model_path.is_file() or model_path.suffix.lower() != ".gguf":
+        raise ValueError("Cortex's built-in backend requires an existing .gguf model file.")
+
+    threads = model.threads or automatic_threads()
+    threads_batch = model.threads_batch or threads
+    command = [
+        resolve_python_executable(),
+        "-m",
+        "cortex_llmhoster.embedded_backend",
+        "--model-path",
+        str(model_path),
+        "--model-alias",
+        model.upstream_model,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--api-base-path",
+        model.api_base_path,
+        "--health-path",
+        model.health_path,
+        "--context-size",
+        str(model.context_size),
+        "--threads",
+        str(threads),
+        "--threads-batch",
+        str(threads_batch),
+        "--gpu-layers",
+        str(model.gpu_layers),
+        "--batch-size",
+        str(model.batch_size),
+    ]
+    if not model.use_mmap:
+        command.append("--no-mmap")
+    if model.mlock:
+        command.append("--mlock")
+    if model.embedding:
+        command.append("--embedding")
+    return command
+
+
+def _resolve_cortex_cpp_binary() -> str | None:
+    """Find Cortex's native GGUF host without relying on Python model bindings."""
+
+    configured = os.environ.get("CORTEX_CPP_HOST")
+    if configured:
+        resolved = _resolve_executable(configured)
+        return str(Path(resolved).resolve()) if resolved else None
+
+    executable = "cortex-gguf-host.exe" if os.name == "nt" else "cortex-gguf-host"
+    project_root = Path(__file__).resolve().parents[2]
+    candidates = (
+        project_root / "native" / "build" / "bin" / executable,
+        project_root / "native" / "build" / executable,
+        project_root / "native" / "build" / "bin" / "Release" / executable,
+        project_root / "native" / "build" / "Release" / executable,
+    )
+    for candidate in candidates:
+        if candidate.is_file() and (os.name == "nt" or os.access(candidate, os.X_OK)):
+            return str(candidate)
+    resolved = shutil.which(executable)
+    return str(Path(resolved).resolve()) if resolved else None
+
+
+def _resolve_cpp_converter_python() -> str:
+    """Resolve an optional Python interpreter used only by upstream converters."""
+
+    configured = os.environ.get("CORTEX_CPP_CONVERTER_PYTHON")
+    if configured:
+        resolved = _resolve_executable(configured)
+        if not resolved:
+            raise PythonInterpreterError(
+                "CORTEX_CPP_CONVERTER_PYTHON does not point to an executable interpreter."
+            )
+        return str(Path(resolved).resolve())
+    return resolve_python_executable()
+
+
+def build_cortex_cpp_runtime_command(
+    model: ModelConfig,
+    port: int,
+    binary: str,
+    *,
+    model_path: str | Path | None = None,
+) -> list[str]:
+    """Launch the native C++ GGUF process after any source-format conversion."""
+
+    if model.runtime != CORTEX_CPP_RUNTIME:
+        raise ValueError("The native backend requires runtime='cortex-cpp'.")
+    if not binary:
+        raise ValueError("Cortex's native C++ host executable was not found.")
+    selected_path = model_path if model_path is not None else model.model_path
+    if not selected_path:
+        raise ValueError("Cortex's native GGUF backend requires model_path.")
+    if model.mmproj_path:
+        raise ValueError("Cortex's native GGUF backend does not support projector files.")
+    try:
+        resolved_model_path = Path(selected_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError(f"Could not resolve local model path: {exc}") from exc
+    if not resolved_model_path.is_file() or resolved_model_path.suffix.lower() != ".gguf":
+        raise ValueError("The native C++ inference process requires a prepared GGUF model file.")
+
+    threads = model.threads or automatic_threads()
+    threads_batch = model.threads_batch or threads
+    command = [
+        binary,
+        "--model-path",
+        str(resolved_model_path),
+        "--model-alias",
+        model.upstream_model,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(port),
+        "--api-base-path",
+        model.api_base_path,
+        "--health-path",
+        model.health_path,
+        "--context-size",
+        str(model.context_size),
+        "--threads",
+        str(threads),
+        "--threads-batch",
+        str(threads_batch),
+        "--gpu-layers",
+        str(model.gpu_layers),
+        "--batch-size",
+        str(model.batch_size),
+        "--ubatch-size",
+        str(model.ubatch_size),
+        "--flash-attn",
+        model.flash_attn,
+        "--cache-type-k",
+        model.cache_type_k,
+        "--cache-type-v",
+        model.cache_type_v,
+    ]
+    if not model.use_mmap:
+        command.append("--no-mmap")
+    if model.mlock:
+        command.append("--mlock")
+    if model.embedding:
+        command.append("--embedding")
+    return command
 
 
 @lru_cache(maxsize=128)
@@ -202,9 +394,12 @@ def build_command_runtime_command(model: ModelConfig, port: int) -> list[str]:
         "context_size": str(model.context_size),
     }
     if "model_path" in placeholders:
-        values["model_path"] = (
-            str(Path(model.model_path).expanduser().resolve()) if model.model_path else ""
-        )
+        try:
+            values["model_path"] = (
+                str(Path(model.model_path).expanduser().resolve()) if model.model_path else ""
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"Could not resolve local model path: {exc}") from exc
     if "threads" in placeholders:
         values["threads"] = str(model.threads or automatic_threads())
     if "python" in placeholders:
@@ -222,6 +417,18 @@ def _resolve_executable(executable: str) -> str | None:
     return shutil.which(expanded)
 
 
+def _runtime_child_environment(settings: Settings) -> dict[str, str]:
+    """Keep runtime helpers from inheriting Cortex dashboard authentication secrets."""
+
+    environment = os.environ.copy()
+    secret_names = {"CORTEX_API_KEY", "CORTEX_ADMIN_PASSWORD"}
+    if settings.api_key_env:
+        secret_names.add(settings.api_key_env)
+    for name in secret_names:
+        environment.pop(name, None)
+    return environment
+
+
 @dataclass(slots=True)
 class RuntimeSlot:
     model: ModelConfig
@@ -234,6 +441,8 @@ class RuntimeSlot:
     started_at: float | None = None
     monitor_task: asyncio.Task[None] | None = None
     output_task: asyncio.Task[None] | None = None
+    preparation_task: asyncio.Task[None] | None = None
+    preparation_process: asyncio.subprocess.Process | None = None
 
 
 class LocalRuntimeManager:
@@ -255,6 +464,7 @@ class LocalRuntimeManager:
         self._slots: dict[str, RuntimeSlot] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._settings_lock = asyncio.Lock()
+        self._conversion_locks: dict[str, asyncio.Lock] = {}
         self.hardware = hardware if hardware is not None else detect_hardware()
 
     def _slot(self, model_id: str) -> RuntimeSlot:
@@ -277,13 +487,148 @@ class LocalRuntimeManager:
             if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
                 return expanded
             return shutil.which(expanded)
-        return shutil.which("llama-server")
+            return shutil.which("llama-server")
+
+    def _embedded_python_available(self) -> tuple[str | None, bool]:
+        try:
+            python_executable = resolve_python_executable()
+            probe = subprocess.run(
+                [python_executable, "-c", "import llama_cpp"],
+                capture_output=True,
+                check=False,
+                timeout=10,
+                env=_runtime_child_environment(self.settings),
+            )
+        except (OSError, PythonInterpreterError, subprocess.SubprocessError):
+            return None, False
+        return python_executable, probe.returncode == 0
 
     @staticmethod
     def _free_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
+
+    async def _run_native_conversion(
+        self,
+        slot: RuntimeSlot,
+        command: list[str],
+        working_directory: str,
+    ) -> None:
+        """Run a one-time local format conversion without blocking Cortex's event loop."""
+
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            cwd=working_directory,
+            env=_runtime_child_environment(self.settings),
+        )
+        slot.preparation_process = process
+        if process.stdout is not None:
+            while line := await process.stdout.readline():
+                slot.output.append(line.decode("utf-8", errors="replace").rstrip()[-500:])
+        code = await process.wait()
+        slot.preparation_process = None
+        if code != 0:
+            tail = "; ".join(list(slot.output)[-3:])
+            detail = f" Last converter output: {tail}" if tail else ""
+            raise RuntimeError(f"The model conversion process exited with code {code}.{detail}")
+
+    async def _prepare_and_start_native_model(
+        self,
+        model: ModelConfig,
+        slot: RuntimeSlot,
+        binary: str,
+        source: NativeModelSource,
+        source_dir: Path,
+        python_executable: str,
+    ) -> None:
+        """Convert a supported source model once, then exec the native inference process."""
+
+        temp_dir: Path | None = None
+        try:
+            outtype = model.conversion_outtype
+            cache_key = native_conversion_cache_key(source, outtype)
+            cache_dir = native_conversion_cache_dir(cache_key)
+            converted_model = cached_native_conversion(cache_dir, cache_key, outtype)
+            if converted_model is None:
+                lock = self._conversion_locks.setdefault(str(source.source_path), asyncio.Lock())
+                async with lock:
+                    converted_model = cached_native_conversion(cache_dir, cache_key, outtype)
+                    if converted_model is None:
+                        temp_dir = create_native_conversion_temp_dir()
+                        command = build_native_conversion_command(
+                            source,
+                            source_dir,
+                            temp_dir,
+                            python_executable,
+                            outtype,
+                            model.upstream_model,
+                        )
+                        slot.command = command
+                        slot.output.append(
+                            f"Converting {source.kind} model to {outtype} GGUF using llama.cpp."
+                        )
+                        working_directory = str(
+                            source.source_path
+                            if source.source_path.is_dir()
+                            else source.source_path.parent
+                        )
+                        await self._run_native_conversion(slot, command, working_directory)
+                        converted_model = publish_native_conversion(
+                            temp_dir, cache_dir, cache_key, outtype
+                        )
+                        temp_dir = None
+
+            slot.output.append(f"Using native GGUF model: {converted_model}")
+            command = build_cortex_cpp_runtime_command(
+                model,
+                slot.port or 0,
+                binary,
+                model_path=converted_model,
+            )
+            slot.command = command
+            slot.process = await asyncio.create_subprocess_exec(
+                *command,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                cwd=str(converted_model.parent),
+                env=_runtime_child_environment(self.settings),
+            )
+            slot.started_at = time.monotonic()
+            slot.output_task = asyncio.create_task(
+                self._read_output(slot), name=f"runtime-output-{model.id}"
+            )
+            slot.monitor_task = asyncio.create_task(
+                self._monitor(model.id, slot), name=f"runtime-monitor-{model.id}"
+            )
+        except asyncio.CancelledError:
+            process = slot.preparation_process
+            if process is not None and process.returncode is None:
+                try:
+                    process.terminate()
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=6.0)
+                except TimeoutError:
+                    try:
+                        process.kill()
+                    except ProcessLookupError:
+                        pass
+                    await process.wait()
+            raise
+        except (OSError, RuntimeError, ValueError, NativeModelSourceError) as exc:
+            slot.status = "error"
+            slot.error = f"Cortex native model preparation failed: {exc}"
+        finally:
+            slot.preparation_process = None
+            if temp_dir is not None:
+                discard_native_conversion_temp(temp_dir)
+            slot.preparation_task = None
 
     async def start_configured(self) -> None:
         """Start only the default model to avoid loading every model into RAM/VRAM."""
@@ -303,8 +648,12 @@ class LocalRuntimeManager:
             slot = self._slot(model_id)
             if slot.process is not None and slot.process.returncode is None:
                 return self.state(model_id)
+            if slot.preparation_task is not None and not slot.preparation_task.done():
+                return self.state(model_id)
             await self._cancel_tasks(slot)
             slot.process = None
+            slot.preparation_process = None
+            slot.preparation_task = None
             slot.port = None
             slot.started_at = None
             slot.model = model
@@ -312,7 +661,14 @@ class LocalRuntimeManager:
             slot.error = None
             slot.output.clear()
 
-            model_path = Path(model.model_path).expanduser().resolve() if model.model_path else None
+            try:
+                model_path = (
+                    Path(model.model_path).expanduser().resolve() if model.model_path else None
+                )
+            except (OSError, RuntimeError, ValueError) as exc:
+                slot.status = "error"
+                slot.error = f"Could not resolve local model path: {exc}"
+                return self.state(model_id)
             if model.runtime == "llama.cpp":
                 if model_path is None or not model_path.is_file():
                     slot.status = "error"
@@ -330,16 +686,129 @@ class LocalRuntimeManager:
                         "or set server.llama_server_path / CORTEX_LLAMA_SERVER."
                     )
                     return self.state(model_id)
-                slot.port = self._free_port()
-                slot.command = build_llama_command(binary, model, slot.port)
+                try:
+                    slot.port = self._free_port()
+                except OSError as exc:
+                    slot.status = "error"
+                    slot.error = f"Could not reserve a local runtime port: {exc}"
+                    return self.state(model_id)
+                try:
+                    slot.command = build_llama_command(binary, model, slot.port)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    slot.status = "error"
+                    slot.error = str(exc)
+                    return self.state(model_id)
                 cwd = str(model_path.parent)
                 runtime_name = "llama-server"
+            elif model.runtime == CORTEX_RUNTIME:
+                if model_path is None or not model_path.is_file():
+                    slot.status = "error"
+                    slot.error = f"GGUF model file not found: {model_path or model.model_path}"
+                    return self.state(model_id)
+                try:
+                    slot.port = self._free_port()
+                    slot.command = build_cortex_runtime_command(model, slot.port)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    slot.status = "error"
+                    slot.error = str(exc)
+                    return self.state(model_id)
+                cwd = str(model_path.parent)
+                runtime_name = "Cortex Python GGUF backend"
+            elif model.runtime == CORTEX_CPP_RUNTIME:
+                if model_path is None:
+                    slot.status = "error"
+                    slot.error = "Cortex's native C++ backend requires a model_path."
+                    return self.state(model_id)
+                binary = _resolve_cortex_cpp_binary()
+                if not binary:
+                    slot.status = "error"
+                    slot.error = (
+                        "Cortex's native C++ host was not found. Build the native target or "
+                        "set CORTEX_CPP_HOST to its executable path."
+                    )
+                    return self.state(model_id)
+                try:
+                    source = inspect_native_model_source(model_path)
+                except (OSError, RuntimeError, ValueError) as exc:
+                    slot.status = "error"
+                    slot.error = str(exc)
+                    return self.state(model_id)
+                if (
+                    source.requires_unsafe_pickle
+                    and not model.allow_unsafe_legacy_checkpoint_conversion
+                ):
+                    slot.status = "error"
+                    slot.error = (
+                        "Legacy .pt/.pth/.bin/.ckpt conversion can deserialize pickle data. "
+                        "Only enable allow_unsafe_legacy_checkpoint_conversion for a trusted "
+                        "LLaMA checkpoint."
+                    )
+                    return self.state(model_id)
+                try:
+                    slot.port = self._free_port()
+                except OSError as exc:
+                    slot.status = "error"
+                    slot.error = f"Could not reserve a local runtime port: {exc}"
+                    return self.state(model_id)
+
+                if source.kind == "gguf":
+                    try:
+                        assert source.gguf_path is not None
+                        slot.command = build_cortex_cpp_runtime_command(
+                            model, slot.port, binary, model_path=source.gguf_path
+                        )
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        slot.status = "error"
+                        slot.error = str(exc)
+                        return self.state(model_id)
+                    cwd = str(source.gguf_path.parent)
+                    runtime_name = "Cortex native C++ backend"
+                else:
+                    source_dir = resolve_llama_cpp_source_dir()
+                    if source_dir is None:
+                        slot.status = "error"
+                        slot.error = (
+                            "Source-model conversion needs the llama.cpp source fetched by the "
+                            "native CMake build. Build native/ or set CORTEX_LLAMA_CPP_SOURCE_DIR."
+                        )
+                        return self.state(model_id)
+                    script = converter_script(source_dir, source.kind)
+                    if not script.is_file():
+                        slot.status = "error"
+                        slot.error = f"The llama.cpp model converter was not found: {script}"
+                        return self.state(model_id)
+                    try:
+                        python_executable = _resolve_cpp_converter_python()
+                        slot.preparation_task = asyncio.create_task(
+                            self._prepare_and_start_native_model(
+                                model,
+                                slot,
+                                binary,
+                                source,
+                                source_dir,
+                                python_executable,
+                            ),
+                            name=f"runtime-prepare-{model_id}",
+                        )
+                    except (OSError, PythonInterpreterError, RuntimeError, ValueError) as exc:
+                        slot.status = "error"
+                        slot.error = (
+                            "A Python interpreter is used only for optional llama.cpp source "
+                            f"conversion; it is not used for inference. {exc}"
+                        )
+                        return self.state(model_id)
+                    return self.state(model_id)
             else:
                 if model_path is not None and not model_path.exists():
                     slot.status = "error"
                     slot.error = f"Local model path not found: {model_path}"
                     return self.state(model_id)
-                slot.port = self._free_port()
+                try:
+                    slot.port = self._free_port()
+                except OSError as exc:
+                    slot.status = "error"
+                    slot.error = f"Could not reserve a local runtime port: {exc}"
+                    return self.state(model_id)
                 try:
                     slot.command = build_command_runtime_command(model, slot.port)
                 except ValueError as exc:
@@ -370,6 +839,7 @@ class LocalRuntimeManager:
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
                     cwd=cwd,
+                    env=_runtime_child_environment(self.settings),
                 )
             except (OSError, ValueError) as exc:
                 slot.status = "error"
@@ -391,9 +861,21 @@ class LocalRuntimeManager:
         process = slot.process
         if process is None or process.stdout is None:
             return
+        pending = bytearray()
         try:
-            while line := await process.stdout.readline():
-                slot.output.append(line.decode("utf-8", errors="replace").rstrip()[-500:])
+            while chunk := await process.stdout.read(4096):
+                pending.extend(chunk)
+                while (newline := pending.find(b"\n")) >= 0:
+                    line = bytes(pending[:newline])
+                    del pending[: newline + 1]
+                    slot.output.append(line.decode("utf-8", errors="replace").rstrip()[-500:])
+                while len(pending) > 64 * 1024:
+                    fragment = bytes(pending[: 64 * 1024])
+                    del pending[: 64 * 1024]
+                    text = fragment.decode("utf-8", errors="replace").rstrip()
+                    slot.output.append(f"{text[-480:]} … [continued]")
+            if pending:
+                slot.output.append(pending.decode("utf-8", errors="replace").rstrip()[-500:])
         except (asyncio.CancelledError, OSError):
             return
 
@@ -402,17 +884,31 @@ class LocalRuntimeManager:
         if process is None or slot.port is None:
             return
         health_url = f"http://127.0.0.1:{slot.port}{slot.model.health_path}"
+        consecutive_failures = 0
         try:
             while process.returncode is None:
-                if slot.status != "running":
-                    try:
-                        response = await self.client.get(health_url, timeout=0.75)
-                        if response.is_success:
-                            slot.status = "running"
-                            slot.error = None
-                    except httpx.RequestError:
-                        pass
-                await asyncio.sleep(0.5)
+                if slot.status in {"stopping", "stopped"}:
+                    await asyncio.sleep(0.1)
+                    continue
+                healthy = False
+                try:
+                    response = await self.client.get(health_url, timeout=0.75)
+                    healthy = response.is_success
+                except httpx.RequestError:
+                    pass
+
+                if healthy:
+                    consecutive_failures = 0
+                    slot.status = "running"
+                    slot.error = None
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3 and slot.status == "running":
+                        slot.status = "starting"
+                        slot.error = "Local runtime health check failed; retrying."
+
+                interval = 2.0 if slot.status == "running" and consecutive_failures == 0 else 0.5
+                await asyncio.sleep(interval)
             code = await process.wait()
             if slot.status != "stopped":
                 slot.status = "error"
@@ -425,6 +921,11 @@ class LocalRuntimeManager:
             slot = self._slots.get(model_id)
             if slot is None:
                 return {"id": model_id, "status": "stopped", "logs": []}
+            preparation_task = slot.preparation_task
+            if preparation_task is not None and not preparation_task.done():
+                slot.status = "stopping"
+                preparation_task.cancel()
+                await asyncio.gather(preparation_task, return_exceptions=True)
             process = slot.process
             if process is not None and process.returncode is None:
                 slot.status = "stopping"
@@ -454,7 +955,7 @@ class LocalRuntimeManager:
     async def _cancel_tasks(self, slot: RuntimeSlot) -> None:
         tasks = [
             task
-            for task in (slot.monitor_task, slot.output_task)
+            for task in (slot.monitor_task, slot.output_task, slot.preparation_task)
             if task is not None and not task.done()
         ]
         for task in tasks:
@@ -463,6 +964,8 @@ class LocalRuntimeManager:
             await asyncio.gather(*tasks, return_exceptions=True)
         slot.monitor_task = None
         slot.output_task = None
+        slot.preparation_task = None
+        slot.preparation_process = None
 
     async def apply_settings(self, settings: Settings) -> None:
         async with self._settings_lock:
@@ -520,12 +1023,24 @@ class LocalRuntimeManager:
             await self.start(new_default.id)
 
     def test(self, model: ModelConfig) -> dict[str, Any]:
-        path = Path(model.model_path).expanduser() if model.model_path else None
-        exists = path is not None and path.exists()
-        size = path.stat().st_size if exists and path is not None and path.is_file() else 0
-        projector_exists = (
-            model.mmproj_path is None or Path(model.mmproj_path).expanduser().is_file()
-        )
+        path = None
+        exists = False
+        size = 0
+        if model.model_path:
+            try:
+                path = Path(model.model_path).expanduser()
+                path_stat = path.stat()
+                exists = True
+                size = path_stat.st_size if path.is_file() else 0
+            except (OSError, RuntimeError, ValueError):
+                path = None
+                exists = False
+        try:
+            projector_exists = (
+                model.mmproj_path is None or Path(model.mmproj_path).expanduser().is_file()
+            )
+        except (OSError, RuntimeError, ValueError):
+            projector_exists = False
         if model.runtime == "llama.cpp":
             runner = self._resolve_binary()
             ready = bool(
@@ -541,6 +1056,72 @@ class LocalRuntimeManager:
                 if ready
                 else "Check the GGUF/projector paths and install/configure llama-server."
             )
+        elif model.runtime == CORTEX_RUNTIME:
+            runner, package_available = self._embedded_python_available()
+            model_path_ready = bool(
+                exists and path is not None and path.is_file() and path.suffix.lower() == ".gguf"
+            )
+            ready = bool(runner and package_available and model_path_ready)
+            message = (
+                "Cortex's built-in GGUF backend and local model are ready to start."
+                if ready
+                else "Install cortex-llmhoster[embedded] in the selected Python environment "
+                "and check the GGUF model path."
+            )
+        elif model.runtime == CORTEX_CPP_RUNTIME:
+            runner = _resolve_cortex_cpp_binary()
+            source = None
+            if model.model_path:
+                try:
+                    source = inspect_native_model_source(model.model_path)
+                except (OSError, RuntimeError, ValueError):
+                    source = None
+            model_path_ready = source is not None
+            converter_ready = True
+            if source is not None and source.kind != "gguf":
+                source_dir = resolve_llama_cpp_source_dir()
+                converter_ready = bool(
+                    source_dir is not None and converter_script(source_dir, source.kind).is_file()
+                )
+                try:
+                    _resolve_cpp_converter_python()
+                except (OSError, PythonInterpreterError, RuntimeError, ValueError):
+                    converter_ready = False
+                if (
+                    source.requires_unsafe_pickle
+                    and not model.allow_unsafe_legacy_checkpoint_conversion
+                ):
+                    converter_ready = False
+            ready = bool(
+                runner and model_path_ready and converter_ready and model.mmproj_path is None
+            )
+            if not runner:
+                message = "Build native/cortex-gguf-host or set CORTEX_CPP_HOST."
+            elif not model_path_ready:
+                message = "Select an existing GGUF, supported Hugging Face model directory, or legacy LLaMA checkpoint."
+            elif (
+                source is not None
+                and source.requires_unsafe_pickle
+                and not model.allow_unsafe_legacy_checkpoint_conversion
+            ):
+                message = (
+                    "Legacy checkpoint conversion may deserialize pickle data; explicitly enable "
+                    "the unsafe-conversion option only for a trusted checkpoint."
+                )
+            elif source is not None and source.kind != "gguf" and not converter_ready:
+                message = (
+                    "Source weights need the llama.cpp converter scripts and a Python interpreter "
+                    "for one-time conversion; inference remains native C++."
+                )
+            elif model.mmproj_path is not None:
+                message = "The native C++ GGUF adapter does not support projector files."
+            elif source is not None and source.kind == "gguf":
+                message = "Cortex's native C++ host and GGUF model are ready to start."
+            else:
+                message = (
+                    "Cortex's native C++ host and source model are ready for conversion. "
+                    "The converter's optional framework dependencies may still be required."
+                )
         else:
             try:
                 command = build_command_runtime_command(model, 1)
@@ -588,7 +1169,13 @@ class LocalRuntimeManager:
             "capabilities": list(model.effective_capabilities),
             "status": slot.status,
             "error": slot.error,
-            "pid": slot.process.pid if slot.process is not None else None,
+            "pid": (
+                slot.process.pid
+                if slot.process is not None
+                else slot.preparation_process.pid
+                if slot.preparation_process is not None
+                else None
+            ),
             "port": slot.port,
             "base_url": self.local_base_url(model),
             "uptime_seconds": uptime,
@@ -600,8 +1187,19 @@ class LocalRuntimeManager:
         return {model_id: self.state(model_id) for model_id in self.settings.models}
 
     async def close(self) -> None:
-        for model_id in list(self._slots):
-            await self.stop(model_id)
+        """Stop every managed process concurrently so shutdown time stays bounded."""
+
+        model_ids = list(self._slots)
+        results = await asyncio.gather(
+            *(self.stop(model_id) for model_id in model_ids), return_exceptions=True
+        )
+        for model_id, result in zip(model_ids, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, Exception):
+                logger.error(
+                    "Could not stop local runtime %s during shutdown: %s", model_id, result
+                )
 
 
 # Backwards-compatible name retained for callers from the GGUF-only version.

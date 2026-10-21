@@ -6,19 +6,21 @@ import asyncio
 import logging
 import os
 import platform
+import re
 import ssl
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
 from time import time
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit
+from uuid import uuid4
 
 import httpx
 import orjson
 from starlette.applications import Starlette
 from starlette.datastructures import Headers, UploadFile
 from starlette.middleware import Middleware
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response, StreamingResponse
 from starlette.routing import Route
 
@@ -27,6 +29,7 @@ from .auth import SESSION_COOKIE_NAME, is_authenticated, session_signing_key
 from .config import ConfigurationError, ModelConfig, Settings, resolve_admin_config_path
 from .dashboard import (
     InferenceMetrics,
+    LoginAttemptLimiter,
     admin_metrics,
     admin_state,
     auth_login,
@@ -49,6 +52,7 @@ from .dashboard import (
     update_config,
 )
 from .dashboard_models import detect_model_capabilities_route, model_files, upload_model_file
+from .http_utils import content_length_from_headers
 from .responses import OrjsonResponse
 from .responses import error_response as _error
 from .runtime import LocalRuntimeManager, automatic_threads, detect_hardware
@@ -498,14 +502,8 @@ def _message_capabilities(value: object) -> set[str]:
     elif isinstance(value, list):
         for item in value:
             found.update(_message_capabilities(item))
-    elif isinstance(value, str):
-        lowered = value.lower()
-        if lowered.startswith("data:image/"):
-            found.add("vision_understanding")
-        elif lowered.startswith("data:audio/"):
-            found.add("audio_understanding")
-        elif any(extension in lowered for extension in (".mp4", ".mov", ".webm", ".mkv")):
-            found.add("video_understanding")
+    # Do not infer a media request from arbitrary prose: a text prompt may
+    # mention a filename or data-URI example without attaching that media.
     return found
 
 
@@ -549,6 +547,7 @@ _HOP_BY_HOP_HEADERS = {
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
+    "proxy-connection",
     "te",
     "trailer",
     "transfer-encoding",
@@ -566,7 +565,12 @@ def _response_headers(upstream: httpx.Response) -> dict[str, str]:
         }
     else:
         excluded = _HOP_BY_HOP_HEADERS
-    return {name: value for name, value in upstream.headers.items() if name.lower() not in excluded}
+    # The local runtime does not own Cortex's browser-origin cookie namespace.
+    return {
+        name: value
+        for name, value in upstream.headers.items()
+        if name.lower() not in excluded and name.lower() != "set-cookie"
+    }
 
 
 def _model_timeout() -> OrjsonResponse:
@@ -590,30 +594,33 @@ def _local_model_unavailable() -> OrjsonResponse:
 async def _read_limited_json_body(
     request: Request, limit: int
 ) -> tuple[bytes | None, Response | None]:
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError:
-            return None, _error("Invalid Content-Length header.", status_code=400)
-        if declared_length < 0:
-            return None, _error("Invalid Content-Length header.", status_code=400)
-        if declared_length > limit:
-            return None, _error(
-                f"JSON request body exceeds the {limit}-byte limit.",
-                status_code=413,
-                code="request_too_large",
-            )
+    try:
+        declared_length = content_length_from_headers(request.headers)
+    except ValueError:
+        return None, _error("Invalid Content-Length header.", status_code=400)
+    if declared_length is not None and declared_length > limit:
+        return None, _error(
+            f"JSON request body exceeds the {limit}-byte limit.",
+            status_code=413,
+            code="request_too_large",
+        )
 
     body = bytearray()
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > limit:
-            return None, _error(
-                f"JSON request body exceeds the {limit}-byte limit.",
-                status_code=413,
-                code="request_too_large",
-            )
-        body.extend(chunk)
+    try:
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > limit:
+                return None, _error(
+                    f"JSON request body exceeds the {limit}-byte limit.",
+                    status_code=413,
+                    code="request_too_large",
+                )
+            body.extend(chunk)
+    except ClientDisconnect:
+        return None, _error(
+            "The request body was interrupted.",
+            status_code=400,
+            code="request_body_interrupted",
+        )
     return bytes(body), None
 
 
@@ -632,16 +639,12 @@ def _media_size_error(limit: int) -> Response:
 async def _limited_media_stream(request: Request, limit: int):
     """Stream a raw media body with a byte ceiling; do not buffer it in memory."""
 
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError:
-            return None, _error("Invalid Content-Length header.", status_code=400)
-        if declared_length < 0:
-            return None, _error("Invalid Content-Length header.", status_code=400)
-        if declared_length > limit:
-            return None, _media_size_error(limit)
+    try:
+        declared_length = content_length_from_headers(request.headers)
+    except ValueError:
+        return None, _error("Invalid Content-Length header.", status_code=400)
+    if declared_length is not None and declared_length > limit:
+        return None, _media_size_error(limit)
 
     async def stream():
         received = 0
@@ -657,20 +660,16 @@ async def _limited_media_stream(request: Request, limit: int):
 async def _read_limited_multipart_form(request: Request, limit: int):
     """Parse a bounded multipart form, spooling media files instead of buffering RAM."""
 
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            declared_length = int(content_length)
-        except ValueError:
-            return None, _error("Invalid Content-Length header.", status_code=400)
-        if declared_length < 0:
-            return None, _error("Invalid Content-Length header.", status_code=400)
-        if declared_length > limit:
-            return None, _error(
-                f"Media request body exceeds the {limit}-byte limit.",
-                status_code=413,
-                code="request_too_large",
-            )
+    try:
+        declared_length = content_length_from_headers(request.headers)
+    except ValueError:
+        return None, _error("Invalid Content-Length header.", status_code=400)
+    if declared_length is not None and declared_length > limit:
+        return None, _error(
+            f"Media request body exceeds the {limit}-byte limit.",
+            status_code=413,
+            code="request_too_large",
+        )
 
     received = 0
     original_receive = request.receive
@@ -693,6 +692,12 @@ async def _read_limited_multipart_form(request: Request, limit: int):
             status_code=413,
             code="request_too_large",
         )
+    except ClientDisconnect:
+        return None, _error(
+            "The request body was interrupted.",
+            status_code=400,
+            code="request_body_interrupted",
+        )
     except Exception as exc:  # noqa: BLE001 - malformed multipart should be a 400
         logger.debug("Could not parse multipart media request: %s", exc)
         return None, _error("Request body is not valid multipart form data.", status_code=400)
@@ -702,7 +707,7 @@ async def _read_limited_multipart_form(request: Request, limit: int):
 async def health(_: Request) -> Response:
     """Liveness endpoint; it does not make a slow downstream health check."""
 
-    return OrjsonResponse({"status": "ok"})
+    return OrjsonResponse({"status": "ok"}, headers={"cache-control": "no-store"})
 
 
 async def readiness(request: Request) -> Response:
@@ -711,6 +716,7 @@ async def readiness(request: Request) -> Response:
         return OrjsonResponse(
             {"status": "not_ready", "reason": "no_models_configured"},
             status_code=503,
+            headers={"cache-control": "no-store"},
         )
     default_model = settings.models.get(settings.default_model or "")
     if default_model is not None:
@@ -724,6 +730,7 @@ async def readiness(request: Request) -> Response:
                     "runtime_status": runtime_state["status"],
                 },
                 status_code=503,
+                headers={"cache-control": "no-store"},
             )
     elif not any(
         request.app.state.runtime_manager.local_base_url(model) is not None
@@ -732,8 +739,12 @@ async def readiness(request: Request) -> Response:
         return OrjsonResponse(
             {"status": "not_ready", "reason": "no_local_models_running"},
             status_code=503,
+            headers={"cache-control": "no-store"},
         )
-    return OrjsonResponse({"status": "ready", "models": len(settings.models)})
+    return OrjsonResponse(
+        {"status": "ready", "models": len(settings.models)},
+        headers={"cache-control": "no-store"},
+    )
 
 
 async def list_models(request: Request) -> Response:
@@ -781,14 +792,24 @@ async def inference(request: Request) -> Response:
             body, body_error = await _read_limited_json_body(request, settings.max_json_body_bytes)
             if body_error is not None:
                 return body_error
-            assert body is not None
+            if body is None:
+                return _error(
+                    "The request body could not be read.",
+                    status_code=500,
+                    code="request_body_read_failed",
+                )
             if body:
                 try:
                     parsed_body = orjson.loads(body)
                 except orjson.JSONDecodeError:
                     return _error("Request body is not valid JSON.", status_code=400)
-                if isinstance(parsed_body, dict):
-                    json_body = parsed_body
+                if not isinstance(parsed_body, dict):
+                    return _error(
+                        "JSON request body must be an object.",
+                        status_code=400,
+                        code="invalid_request_body",
+                    )
+                json_body = parsed_body
         elif is_multipart and request.query_params.get("model") is None:
             multipart_form, body_error = await _read_limited_multipart_form(
                 request, settings.max_media_body_bytes
@@ -813,7 +834,12 @@ async def inference(request: Request) -> Response:
         model, model_error = _select_model(settings, requested_model)
         if model_error is not None:
             return model_error
-        assert model is not None
+        if model is None:
+            return _error(
+                "The configured model could not be selected.",
+                status_code=500,
+                code="model_selection_failed",
+            )
 
         route_path = request.path_params.get("path", "").strip("/")
         required_capabilities = _required_capabilities(route_path, json_body, model.capability_set)
@@ -869,6 +895,7 @@ async def inference(request: Request) -> Response:
             if name in request.headers
             and not (multipart_form is not None and name == "content-type")
         }
+        outgoing_headers["x-request-id"] = request.state.request_id
         client: httpx.AsyncClient = request.app.state.http_client
         metrics: InferenceMetrics = request.app.state.metrics
         metrics_started_at = metrics.start(model.id)
@@ -926,6 +953,13 @@ async def inference(request: Request) -> Response:
         except asyncio.CancelledError:
             metrics.finish(metrics_started_at, 499)
             raise
+        except ClientDisconnect:
+            metrics.finish(metrics_started_at, 499)
+            return _error(
+                "The request body was interrupted.",
+                status_code=400,
+                code="request_body_interrupted",
+            )
         except _MediaBodyTooLarge:
             metrics.finish(metrics_started_at, 413)
             return _media_size_error(settings.max_media_body_bytes)
@@ -942,8 +976,25 @@ async def inference(request: Request) -> Response:
             return _model_timeout()
         except httpx.RequestError:
             metrics.finish(metrics_started_at, 502)
-            logger.warning("Could not reach local runtime for model %s", model.id)
+            logger.warning(
+                "Could not reach local runtime for model %s (request_id=%s)",
+                model.id,
+                request.state.request_id,
+            )
             return _local_model_unavailable()
+        except Exception:
+            metrics.finish(metrics_started_at, 500)
+            logger.exception(
+                "Unexpected failure handling local-runtime request for model %s (request_id=%s)",
+                model.id,
+                request.state.request_id,
+            )
+            return _error(
+                "Cortex encountered an unexpected error while processing the request.",
+                status_code=500,
+                error_type="server_error",
+                code="model_request_failed",
+            )
 
         async def relay():
             final_status = upstream_response.status_code
@@ -962,7 +1013,19 @@ async def inference(request: Request) -> Response:
                 raise
             except httpx.HTTPError:
                 final_status = 502
-                logger.warning("Local runtime stream failed for model %s", model.id)
+                logger.warning(
+                    "Local runtime stream failed for model %s (request_id=%s)",
+                    model.id,
+                    request.state.request_id,
+                )
+                raise
+            except Exception:
+                final_status = 502
+                logger.exception(
+                    "Unexpected local-runtime stream failure for model %s (request_id=%s)",
+                    model.id,
+                    request.state.request_id,
+                )
                 raise
             finally:
                 try:
@@ -1018,6 +1081,91 @@ class InferenceRequestLimiter:
         self.limit = limit
 
 
+_REQUEST_ID_PATTERN = re.compile(r"[A-Za-z0-9._-]{1,128}")
+
+
+class RequestIDMiddleware:
+    """Attach a safe correlation ID to every HTTP response and downstream call."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        headers = Headers(scope=scope)
+        supplied = headers.get("x-request-id", "")
+        request_id = supplied if _REQUEST_ID_PATTERN.fullmatch(supplied) else uuid4().hex
+        state = scope.setdefault("state", {})
+        if not isinstance(state, dict):
+            state = {}
+            scope["state"] = state
+        state["request_id"] = request_id
+
+        async def send_with_request_id(message) -> None:
+            if message.get("type") == "http.response.start":
+                response_headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"x-request-id"
+                ]
+                response_headers.append((b"x-request-id", request_id.encode("ascii")))
+                message = {**message, "headers": response_headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_request_id)
+
+
+class RequestIDStarlette(Starlette):
+    """Run request-ID handling outside Starlette's server-error responses."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._request_id_application = RequestIDMiddleware(super().__call__)
+
+    async def __call__(self, scope, receive, send) -> None:
+        await self._request_id_application(scope, receive, send)
+
+
+class InferenceResponseHeadersMiddleware:
+    """Prevent shared caches from retaining prompts, outputs, or model listings."""
+
+    def __init__(self, app, *, api_base_path: str, models_endpoint: str) -> None:
+        self.app = app
+        normalized_base = api_base_path.rstrip("/")
+        self._api_prefix = f"{normalized_base}/" if normalized_base else "/"
+        self._models_endpoint = models_endpoint
+
+    async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "")
+        if scope.get("type") != "http" or not (
+            path.startswith(self._api_prefix) or path == self._models_endpoint
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_uncached(message) -> None:
+            if message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in {b"cache-control", b"pragma", b"x-content-type-options"}
+                ]
+                headers.extend(
+                    (
+                        (b"cache-control", b"no-store"),
+                        (b"pragma", b"no-cache"),
+                        (b"x-content-type-options", b"nosniff"),
+                    )
+                )
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_uncached)
+
+
 class InferenceCapacityMiddleware:
     """Bound active inference work before the route consumes request bodies."""
 
@@ -1065,8 +1213,40 @@ class InferenceCapacityMiddleware:
             self._limiter.release()
 
 
+class AdminResponseHeadersMiddleware:
+    """Prevent browser/proxy caches from retaining authenticated dashboard data."""
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "")
+        if scope.get("type") != "http" or not path.startswith("/admin/api/"):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_uncached(message) -> None:
+            if message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() not in {b"cache-control", b"pragma", b"x-content-type-options"}
+                ]
+                headers.extend(
+                    (
+                        (b"cache-control", b"no-store"),
+                        (b"pragma", b"no-cache"),
+                        (b"x-content-type-options", b"nosniff"),
+                    )
+                )
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_uncached)
+
+
 class SessionOriginMiddleware:
-    """Reject cross-origin unsafe browser requests authenticated by a session cookie."""
+    """Require verifiable same-origin metadata for unsafe session-cookie requests."""
 
     _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
@@ -1074,34 +1254,92 @@ class SessionOriginMiddleware:
         self.app = app
         self.cookie_name = f"{cookie_name}="
 
+    @staticmethod
+    def _origin_key(scheme: str, authority: str) -> tuple[str, str, int] | None:
+        scheme = scheme.strip().lower()
+        if (
+            scheme not in {"http", "https"}
+            or not authority
+            or authority.endswith(":")
+            or "\\" in authority
+            or any(c.isspace() for c in authority)
+        ):
+            return None
+        try:
+            parsed = urlsplit(f"{scheme}://{authority}")
+            if (
+                parsed.username is not None
+                or parsed.password is not None
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+                or not parsed.hostname
+            ):
+                return None
+            raw_hostname = parsed.hostname
+            if raw_hostname.endswith(".."):
+                return None
+            normalized_hostname = raw_hostname.removesuffix(".")
+            if not normalized_hostname:
+                return None
+            hostname = normalized_hostname.encode("idna").decode("ascii").lower()
+            explicit_port = parsed.port
+            port = (
+                explicit_port if explicit_port is not None else (443 if scheme == "https" else 80)
+            )
+        except (UnicodeError, ValueError):
+            return None
+        return scheme, hostname, port
+
+    @classmethod
+    def _matches_origin(
+        cls,
+        candidate: str,
+        request_scheme: str,
+        request_host: str,
+        *,
+        allow_path: bool,
+    ) -> bool:
+        try:
+            parsed = urlsplit(candidate)
+        except ValueError:
+            return False
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        if not allow_path and (parsed.path not in {"", "/"} or parsed.query or parsed.fragment):
+            return False
+        candidate_key = cls._origin_key(parsed.scheme, parsed.netloc)
+        request_key = cls._origin_key(request_scheme, request_host)
+        return candidate_key is not None and candidate_key == request_key
+
     async def __call__(self, scope, receive, send) -> None:
         if scope.get("type") == "http" and scope.get("method") not in self._SAFE_METHODS:
             headers = Headers(scope=scope)
             cookies = headers.get("cookie", "").split(";")
             has_session = any(part.strip().startswith(self.cookie_name) for part in cookies)
             if has_session:
+                forwarded_scheme = headers.get("x-forwarded-proto", "").split(",", 1)[0]
+                request_scheme = (forwarded_scheme or scope.get("scheme", "http")).strip()
+                forwarded_host = headers.get("x-forwarded-host", "").split(",", 1)[0]
+                request_host = (forwarded_host or headers.get("host", "")).strip()
                 origin = headers.get("origin")
                 if origin:
-                    parsed_origin = urlsplit(origin)
-                    forwarded_scheme = headers.get("x-forwarded-proto", "").split(",", 1)[0]
-                    request_scheme = (forwarded_scheme or scope.get("scheme", "http")).strip()
-                    forwarded_host = headers.get("x-forwarded-host", "").split(",", 1)[0]
-                    request_host = (forwarded_host or headers.get("host", "")).strip()
-                    if (
-                        parsed_origin.scheme.lower() != request_scheme.lower()
-                        or parsed_origin.netloc.lower() != request_host.lower()
-                    ):
-                        response = _error(
-                            "Cross-origin session requests are not allowed.",
-                            status_code=403,
-                            error_type="authentication_error",
-                            code="csrf_origin_rejected",
+                    same_origin = self._matches_origin(
+                        origin, request_scheme, request_host, allow_path=False
+                    )
+                else:
+                    referer = headers.get("referer")
+                    if referer:
+                        same_origin = self._matches_origin(
+                            referer, request_scheme, request_host, allow_path=True
                         )
-                        await response(scope, receive, send)
-                        return
-                elif headers.get("sec-fetch-site", "").lower() == "cross-site":
+                    else:
+                        # Without Origin or Referer, only explicit browser metadata can
+                        # safely establish same-origin. Missing metadata is not trusted.
+                        same_origin = headers.get("sec-fetch-site", "").lower() == "same-origin"
+                if not same_origin:
                     response = _error(
-                        "Cross-origin session requests are not allowed.",
+                        "Cross-origin or unverifiable session requests are not allowed.",
                         status_code=403,
                         error_type="authentication_error",
                         code="csrf_origin_rejected",
@@ -1254,20 +1492,27 @@ def create_app(
         ),
     ]
     inference_limiter = InferenceRequestLimiter(runtime_settings.max_inference_requests)
-    app = Starlette(
+    app = RequestIDStarlette(
         routes=routes,
         lifespan=lifespan,
         middleware=[
             Middleware(SessionOriginMiddleware, cookie_name=SESSION_COOKIE_NAME),
+            Middleware(AdminResponseHeadersMiddleware),
+            Middleware(
+                InferenceResponseHeadersMiddleware,
+                api_base_path=api_format.base_path,
+                models_endpoint=api_format.models_endpoint,
+            ),
             Middleware(
                 InferenceCapacityMiddleware,
                 limiter=inference_limiter,
                 api_base_path=api_format.base_path,
                 models_endpoint=api_format.models_endpoint,
-            )
+            ),
         ],
     )
     app.state.inference_limiter = inference_limiter
+    app.state.login_attempt_limiter = LoginAttemptLimiter()
     app.state.settings = runtime_settings
     app.state.worker_count = runtime_settings.workers
     app.state.metrics = InferenceMetrics()

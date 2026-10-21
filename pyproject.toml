@@ -31,6 +31,7 @@ test = [
   "pytest>=8,<9",
   "pytest-asyncio>=0.24,<2",
 ]
+embedded = ["llama-cpp-python>=0.3.8,<1"]
 
 [project.scripts]
 cortex-llmhoster = "cortex_llmhoster.cli:main"

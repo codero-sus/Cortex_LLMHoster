@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import ipaddress
 import os
+import sys
 
 from dotenv import load_dotenv
 
 from . import python_runtime
-from .config import LOCAL_RUNTIMES, ConfigurationError, Settings
+from .config import LOCAL_RUNTIMES, ConfigurationError, Settings, validate_bind_host
 from .python_runtime import PythonInterpreterError, reexec_with_selected_python
 
 
@@ -73,7 +75,19 @@ def main() -> None:
     except ConfigurationError as exc:
         parser.error(str(exc))
 
-    host = args.host or settings.host
+    try:
+        host = validate_bind_host(settings.host if args.host is None else args.host)
+    except ConfigurationError as exc:
+        parser.error(str(exc))
+    try:
+        is_wildcard_address = ipaddress.ip_address(host).is_unspecified
+    except ValueError:
+        is_wildcard_address = False
+    if is_wildcard_address and not settings.api_auth_enabled:
+        print(
+            "WARNING: Cortex is listening on all network interfaces without API authentication.",
+            file=sys.stderr,
+        )
     port = args.port if args.port is not None else settings.port
     workers = args.workers if args.workers is not None else settings.workers
     if port < 1 or port > 65535:

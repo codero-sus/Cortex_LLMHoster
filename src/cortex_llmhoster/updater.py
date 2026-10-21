@@ -148,7 +148,12 @@ async def _stop_installer(process: asyncio.subprocess.Process) -> None:
         await process.wait()
 
 
-async def install_from_commit(commit_sha: str, *, timeout_seconds: float = 300.0) -> str:
+async def install_from_commit(
+    commit_sha: str,
+    *,
+    timeout_seconds: float = 300.0,
+    api_key_env: str = "CORTEX_API_KEY",
+) -> str:
     """Install an immutable archive from the pinned project repository via pip."""
 
     if not _COMMIT_PATTERN.fullmatch(commit_sha):
@@ -161,6 +166,19 @@ async def install_from_commit(commit_sha: str, *, timeout_seconds: float = 300.0
         raise UpdateError(str(exc)) from exc
 
     env = os.environ.copy()
+    secret_names = {"CORTEX_API_KEY", "CORTEX_ADMIN_PASSWORD"}
+    if api_key_env and api_key_env not in {
+        "PATH",
+        "HOME",
+        "TMP",
+        "TEMP",
+        "TMPDIR",
+        "SYSTEMROOT",
+        "WINDIR",
+    }:
+        secret_names.add(api_key_env)
+    for name in secret_names:
+        env.pop(name, None)
     env["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     try:
         process = await asyncio.create_subprocess_exec(

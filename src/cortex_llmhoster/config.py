@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -19,7 +20,12 @@ class ConfigurationError(ValueError):
     """Raised when a Cortex configuration is invalid."""
 
 
-LOCAL_RUNTIMES = frozenset({"llama.cpp", "command"})
+CORTEX_RUNTIME = "cortex"
+CORTEX_CPP_RUNTIME = "cortex-cpp"
+CORTEX_RUNTIMES = frozenset({CORTEX_RUNTIME, CORTEX_CPP_RUNTIME})
+GGUF_RUNTIMES = frozenset({"llama.cpp", *CORTEX_RUNTIMES})
+CPP_CONVERSION_OUTTYPES = frozenset({"f32", "f16", "q8_0"})
+LOCAL_RUNTIMES = frozenset({*GGUF_RUNTIMES, "command"})
 DEFAULT_CAPABILITIES = ("text_generation",)
 OPTIMIZATION_PRESETS = frozenset(
     {
@@ -48,6 +54,9 @@ _OPTIMIZATION_PRESET_ALIASES = {
     "high+": "high_plus",
     "ultra": "ultra",
 }
+_RESERVED_API_KEY_ENV_NAMES = frozenset(
+    {"CORTEX_ADMIN_USERNAME", "CORTEX_ADMIN_PASSWORD", "CORTEX_API_AUTH_ENABLED"}
+)
 _COMMAND_PLACEHOLDERS = frozenset(
     {
         "model_path",
@@ -69,6 +78,47 @@ def _capability_name(value: str) -> str:
     """Normalize task labels while preserving user-defined future capabilities."""
 
     return value.strip().lower().replace("-", "_")
+
+
+def validate_bind_host(value: object) -> str:
+    """Reject malformed listener addresses before handing them to Uvicorn."""
+
+    error_message = "CORTEX_HOST / server.host must be an IP address or valid DNS hostname."
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or any(ord(character) < 0x21 or ord(character) == 0x7F for character in value)
+        or any(character in value for character in "/\\?#@[]")
+    ):
+        raise ConfigurationError(error_message)
+
+    try:
+        ipaddress.ip_address(value)
+        return value
+    except ValueError:
+        pass
+
+    hostname = value.removesuffix(".")
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ConfigurationError(error_message) from exc
+    labels = ascii_hostname.split(".")
+    if (
+        not ascii_hostname
+        or len(ascii_hostname) > 253
+        or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or re.fullmatch(r"[A-Za-z0-9-]+", label) is None
+            for label in labels
+        )
+    ):
+        raise ConfigurationError(error_message)
+    return value
 
 
 def _validate_runtime_command(command: list[str] | tuple[str, ...], prefix: str) -> set[str]:
@@ -147,6 +197,8 @@ class ModelConfig:
     use_mmap: bool = True
     mlock: bool = False
     embedding: bool = False
+    conversion_outtype: str = "f16"
+    allow_unsafe_legacy_checkpoint_conversion: bool = False
     mmproj_path: str | None = None
     optimization_level: int = 0
     optimization_preset: str | None = None
@@ -207,20 +259,24 @@ class Settings:
     admin_password: str | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if self.api_key is not None and not isinstance(self.api_key, str):
+            raise ConfigurationError("CORTEX_API_KEY must be a string.")
         if self.api_key == "":
             object.__setattr__(self, "api_key", None)
+        if self.admin_username is not None and not isinstance(self.admin_username, str):
+            raise ConfigurationError("CORTEX_ADMIN_USERNAME must be a string.")
+        if self.admin_password is not None and not isinstance(self.admin_password, str):
+            raise ConfigurationError("CORTEX_ADMIN_PASSWORD must be a string.")
         if self.admin_username == "":
             object.__setattr__(self, "admin_username", None)
-        if self.admin_password == "":
+        if isinstance(self.admin_password, str) and not self.admin_password:
             object.__setattr__(self, "admin_password", None)
         if (self.admin_username is None) != (self.admin_password is None):
             raise ConfigurationError(
                 "CORTEX_ADMIN_USERNAME and CORTEX_ADMIN_PASSWORD must be set together."
             )
         if self.api_auth_enabled is None:
-            object.__setattr__(
-                self, "api_auth_enabled", bool(self.api_key or self.admin_username)
-            )
+            object.__setattr__(self, "api_auth_enabled", bool(self.api_key or self.admin_username))
 
     @classmethod
     def load(
@@ -379,12 +435,19 @@ class Settings:
                 not isinstance(model_path, str) or not model_path.strip()
             ):
                 raise ConfigurationError(f"{prefix}.model_path must be a non-empty path string.")
-            if runtime == "llama.cpp":
+            if runtime in GGUF_RUNTIMES:
                 if model_path is None:
-                    raise ConfigurationError(
-                        f"{prefix}.model_path is required for local llama.cpp models."
+                    runtime_label = (
+                        "Cortex's native C++ backend"
+                        if runtime == CORTEX_CPP_RUNTIME
+                        else "Cortex's legacy backend"
+                        if runtime == CORTEX_RUNTIME
+                        else "llama.cpp"
                     )
-                if Path(model_path).suffix.lower() != ".gguf":
+                    raise ConfigurationError(
+                        f"{prefix}.model_path is required for {runtime_label} models."
+                    )
+                if runtime != CORTEX_CPP_RUNTIME and Path(model_path).suffix.lower() != ".gguf":
                     raise ConfigurationError(f"{prefix}.model_path must point to a GGUF file.")
 
             upstream_model = row.get("upstream_model", model_id)
@@ -406,6 +469,14 @@ class Settings:
                     )
                 if normalized not in capabilities:
                     capabilities.append(normalized)
+            if runtime in CORTEX_RUNTIMES:
+                unsupported = set(capabilities) - {"text_generation", "embeddings"}
+                if unsupported:
+                    names = ", ".join(sorted(unsupported))
+                    raise ConfigurationError(
+                        f"{prefix}.capabilities are not supported by Cortex's built-in GGUF "
+                        f"backend: {names}. Use text_generation and/or embeddings."
+                    )
 
             raw_command = row.get("runtime_command", [])
             if not isinstance(raw_command, (list, tuple)) or any(
@@ -458,7 +529,7 @@ class Settings:
                 prefix: str = prefix,
             ) -> int:
                 value = row.get(name, default)
-                if isinstance(value, bool):
+                if isinstance(value, bool) or (isinstance(value, float) and not value.is_integer()):
                     raise ConfigurationError(f"{prefix}.{name} must be an integer.")
                 try:
                     result = int(value)
@@ -492,18 +563,41 @@ class Settings:
                 raise ConfigurationError(
                     f"{prefix} cache types must be f32, f16, bf16, q8_0, q5_0, q5_1, q4_0, or q4_1."
                 )
+            conversion_outtype = row.get("conversion_outtype", "f16")
+            if (
+                not isinstance(conversion_outtype, str)
+                or conversion_outtype not in CPP_CONVERSION_OUTTYPES
+            ):
+                choices = ", ".join(sorted(CPP_CONVERSION_OUTTYPES))
+                raise ConfigurationError(f"{prefix}.conversion_outtype must be one of: {choices}.")
             use_mmap = row.get("use_mmap", True)
             mlock = row.get("mlock", False)
             embedding = row.get("embedding", False)
+            allow_unsafe_legacy_checkpoint_conversion = row.get(
+                "allow_unsafe_legacy_checkpoint_conversion", False
+            )
             mmproj_path = row.get("mmproj_path")
-            if not all(isinstance(value, bool) for value in (use_mmap, mlock, embedding)):
+            if not all(
+                isinstance(value, bool)
+                for value in (
+                    use_mmap,
+                    mlock,
+                    embedding,
+                    allow_unsafe_legacy_checkpoint_conversion,
+                )
+            ):
                 raise ConfigurationError(
-                    f"{prefix}.use_mmap, {prefix}.mlock, and {prefix}.embedding must be booleans."
+                    f"{prefix}.use_mmap, {prefix}.mlock, {prefix}.embedding, and "
+                    f"{prefix}.allow_unsafe_legacy_checkpoint_conversion must be booleans."
                 )
             if mmproj_path is not None and not isinstance(mmproj_path, str):
                 raise ConfigurationError(f"{prefix}.mmproj_path must be a path string.")
             if mmproj_path == "":
                 mmproj_path = None
+            if runtime in CORTEX_RUNTIMES and mmproj_path:
+                raise ConfigurationError(
+                    f"{prefix}.mmproj_path is not supported by Cortex's built-in GGUF backend."
+                )
             if embedding and "embeddings" not in capabilities:
                 capabilities.append("embeddings")
             if (
@@ -512,7 +606,7 @@ class Settings:
                 and "vision_understanding" not in capabilities
             ):
                 capabilities.append("vision_understanding")
-            if runtime == "llama.cpp" and "embeddings" in capabilities:
+            if runtime in GGUF_RUNTIMES and "embeddings" in capabilities:
                 embedding = True
 
             models[model_id] = ModelConfig(
@@ -539,6 +633,8 @@ class Settings:
                 use_mmap=use_mmap,
                 mlock=mlock,
                 embedding=embedding,
+                conversion_outtype=conversion_outtype,
+                allow_unsafe_legacy_checkpoint_conversion=allow_unsafe_legacy_checkpoint_conversion,
                 mmproj_path=mmproj_path,
             )
             is_default = row.get("default", False)
@@ -569,10 +665,17 @@ class Settings:
             )
 
         api_key_env = env.get("CORTEX_API_KEY_ENV", server.get("api_key_env", "CORTEX_API_KEY"))
-        if not isinstance(api_key_env, str):
-            raise ConfigurationError("server.api_key_env must be an environment name.")
+        if (
+            not isinstance(api_key_env, str)
+            or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env) is None
+            or api_key_env.upper() in _RESERVED_API_KEY_ENV_NAMES
+        ):
+            raise ConfigurationError(
+                "server.api_key_env / CORTEX_API_KEY_ENV must be a valid environment name "
+                "that does not reuse Cortex authentication settings."
+            )
         api_key = env.get("CORTEX_API_KEY")
-        if api_key is None and api_key_env:
+        if (api_key is None or api_key == "") and api_key_env:
             api_key = env.get(api_key_env)
         if api_key == "":
             api_key = None
@@ -585,7 +688,7 @@ class Settings:
             raise ConfigurationError("CORTEX_ADMIN_PASSWORD must be a string.")
         if admin_username is not None:
             admin_username = admin_username.strip() or None
-        if admin_password == "":
+        if not admin_password:
             admin_password = None
         if (admin_username is None) != (admin_password is None):
             raise ConfigurationError(
@@ -622,15 +725,17 @@ class Settings:
 
         def setting(name: str, env_name: str, default: float, cast: type):
             value = env.get(env_name, server.get(name, default))
+            invalid_type = isinstance(value, bool) or not isinstance(value, (str, int, float))
+            fractional_integer = cast is int and isinstance(value, float) and not value.is_integer()
+            if invalid_type or fractional_integer:
+                raise ConfigurationError(f"{env_name} / server.{name} is invalid.")
             try:
                 converted = cast(value)
             except (TypeError, ValueError) as exc:
                 raise ConfigurationError(f"{env_name} / server.{name} is invalid.") from exc
             return converted
 
-        host = env.get("CORTEX_HOST", server.get("host", "127.0.0.1"))
-        if not isinstance(host, str) or not host:
-            raise ConfigurationError("CORTEX_HOST / server.host must be a non-empty string.")
+        host = validate_bind_host(env.get("CORTEX_HOST", server.get("host", "127.0.0.1")))
         port = setting("port", "CORTEX_PORT", 8624, int)
         workers = setting("workers", "CORTEX_WORKERS", 1, int)
         if not 1 <= port <= 65535:

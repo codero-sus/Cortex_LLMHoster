@@ -3,19 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import hmac
 import json
+import math
 import os
+import re
+import tempfile
 import time
-from collections import Counter
+import uuid
+from collections import Counter, OrderedDict, deque
 from collections.abc import Mapping
 from dataclasses import replace
+from math import ceil
 from pathlib import Path
 from typing import Any
 
 import httpx
 import orjson
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import HTMLResponse, Response
 
 from . import __version__
@@ -29,12 +36,31 @@ from .auth import (
 )
 from .config import LOCAL_RUNTIMES, ConfigurationError, ModelConfig, Settings
 from .cookbook import HF_TASK_LABELS, cookbook_models, search_hugging_face
+from .http_utils import content_length_from_headers
 from .responses import OrjsonResponse
 from .responses import error_response as _error
 from .updater import UpdateError, check_for_updates, install_from_commit
 
 _UI_PATH = Path(__file__).parent / "static" / "index.html"
 _UI_HTML = _UI_PATH.read_text(encoding="utf-8") if _UI_PATH.is_file() else ""
+
+
+def _inline_script_hashes(document: str) -> tuple[str, ...]:
+    """Compute CSP source hashes for the dashboard's static inline scripts."""
+
+    hashes: list[str] = []
+    pattern = re.compile(r"<script\b([^>]*)>(.*?)</script\s*>", re.IGNORECASE | re.DOTALL)
+    for attributes, source in pattern.findall(document):
+        if re.search(r"(?:^|\s)src(?:\s|=|$)", attributes, re.IGNORECASE):
+            continue
+        digest = base64.b64encode(hashlib.sha256(source.encode("utf-8")).digest()).decode("ascii")
+        source_hash = f"'sha256-{digest}'"
+        if source_hash not in hashes:
+            hashes.append(source_hash)
+    return tuple(hashes)
+
+
+_SCRIPT_CSP_SOURCES = " ".join(("'self'", *_inline_script_hashes(_UI_HTML)))
 _RESTART_FIELDS = (
     "host",
     "port",
@@ -67,6 +93,59 @@ _SERVER_FIELDS = (
 )
 
 
+class LoginAttemptLimiter:
+    """Bound repeated failed sign-ins per client without retaining credentials."""
+
+    def __init__(
+        self, *, max_attempts: int = 10, window_seconds: float = 60.0, max_clients: int = 4096
+    ) -> None:
+        if (
+            max_attempts < 1
+            or max_clients < 1
+            or not math.isfinite(window_seconds)
+            or window_seconds <= 0
+        ):
+            raise ValueError("Login rate-limit values must be positive and finite.")
+        self.max_attempts = max_attempts
+        self.window_seconds = window_seconds
+        self.max_clients = max_clients
+        self._failures: OrderedDict[str, deque[float]] = OrderedDict()
+
+    def _active_failures(self, client_key: str, now: float) -> deque[float] | None:
+        attempts = self._failures.get(client_key)
+        if attempts is None:
+            return None
+        cutoff = now - self.window_seconds
+        while attempts and attempts[0] <= cutoff:
+            attempts.popleft()
+        if not attempts:
+            self._failures.pop(client_key, None)
+            return None
+        self._failures.move_to_end(client_key)
+        return attempts
+
+    def retry_after(self, client_key: str, *, now: float | None = None) -> int | None:
+        current = time.monotonic() if now is None else now
+        attempts = self._active_failures(client_key, current)
+        if attempts is None or len(attempts) < self.max_attempts:
+            return None
+        return max(1, ceil(self.window_seconds - (current - attempts[0])))
+
+    def record_failure(self, client_key: str, *, now: float | None = None) -> None:
+        current = time.monotonic() if now is None else now
+        attempts = self._active_failures(client_key, current)
+        if attempts is None:
+            attempts = deque()
+            self._failures[client_key] = attempts
+        attempts.append(current)
+        self._failures.move_to_end(client_key)
+        while len(self._failures) > self.max_clients:
+            self._failures.popitem(last=False)
+
+    def clear(self, client_key: str) -> None:
+        self._failures.pop(client_key, None)
+
+
 class InferenceMetrics:
     """Low-overhead per-worker inference API counters for the dashboard."""
 
@@ -79,19 +158,25 @@ class InferenceMetrics:
         self.total_latency_ms = 0.0
         self.status_codes: Counter[str] = Counter()
         self.models: Counter[str] = Counter()
+        self._generation = 0
 
-    def start(self, model_id: str) -> float:
+    def start(self, model_id: str) -> tuple[float, int]:
         self.in_flight += 1
         self.total_requests += 1
         self.models[model_id] += 1
-        return time.perf_counter()
+        return time.perf_counter(), self._generation
 
-    def finish(self, started_at: float, status_code: int) -> None:
+    def finish(self, started: tuple[float, int], status_code: int) -> None:
+        started_at, generation = started
         self.in_flight = max(0, self.in_flight - 1)
+        # A reset starts a new reporting window. In-flight requests from the old
+        # window still leave the active count, but must not repopulate cleared totals.
+        if generation != self._generation:
+            return
         self.completed_requests += 1
         self.total_latency_ms += (time.perf_counter() - started_at) * 1000
         self.status_codes[str(status_code)] += 1
-        if status_code >= 500:
+        if status_code >= 400:
             self.failed_requests += 1
 
     def snapshot(self) -> dict[str, Any]:
@@ -110,6 +195,7 @@ class InferenceMetrics:
         }
 
     def reset(self) -> None:
+        self._generation += 1
         self.total_requests = 0
         self.failed_requests = 0
         self.completed_requests = 0
@@ -186,6 +272,8 @@ def _public_settings(settings: Settings) -> dict[str, Any]:
                 "use_mmap": model.use_mmap,
                 "mlock": model.mlock,
                 "embedding": model.embedding,
+                "conversion_outtype": model.conversion_outtype,
+                "allow_unsafe_legacy_checkpoint_conversion": model.allow_unsafe_legacy_checkpoint_conversion,
                 "mmproj_path": model.mmproj_path,
             }
             for model in settings.models.values()
@@ -223,6 +311,8 @@ def _persistable_settings(settings: Settings) -> dict[str, Any]:
             "use_mmap": model.use_mmap,
             "mlock": model.mlock,
             "embedding": model.embedding,
+            "conversion_outtype": model.conversion_outtype,
+            "allow_unsafe_legacy_checkpoint_conversion": model.allow_unsafe_legacy_checkpoint_conversion,
             "mmproj_path": model.mmproj_path,
             "default": model.id == settings.default_model,
         }
@@ -256,19 +346,25 @@ def _env_overrides() -> list[str]:
 
 
 async def _read_json(request: Request, limit: int = 256 * 1024) -> tuple[Any, Response | None]:
-    content_length = request.headers.get("content-length")
-    if content_length:
-        try:
-            if int(content_length) > limit:
-                return None, _error("Admin request body is too large.", status_code=413)
-        except ValueError:
-            return None, _error("Invalid Content-Length header.", status_code=400)
+    try:
+        declared_length = content_length_from_headers(request.headers)
+    except ValueError:
+        return None, _error("Invalid Content-Length header.", status_code=400)
+    if declared_length is not None and declared_length > limit:
+        return None, _error("Admin request body is too large.", status_code=413)
 
     body = bytearray()
-    async for chunk in request.stream():
-        if len(body) + len(chunk) > limit:
-            return None, _error("Admin request body is too large.", status_code=413)
-        body.extend(chunk)
+    try:
+        async for chunk in request.stream():
+            if len(body) + len(chunk) > limit:
+                return None, _error("Admin request body is too large.", status_code=413)
+            body.extend(chunk)
+    except ClientDisconnect:
+        return None, _error(
+            "The request body was interrupted.",
+            status_code=400,
+            code="request_body_interrupted",
+        )
     try:
         return orjson.loads(body), None
     except orjson.JSONDecodeError:
@@ -322,6 +418,10 @@ def _candidate_settings(payload: Any, current: Settings) -> Settings:
                 "use_mmap": raw_model.get("use_mmap", True),
                 "mlock": raw_model.get("mlock", False),
                 "embedding": raw_model.get("embedding", False),
+                "conversion_outtype": raw_model.get("conversion_outtype", "f16"),
+                "allow_unsafe_legacy_checkpoint_conversion": raw_model.get(
+                    "allow_unsafe_legacy_checkpoint_conversion", False
+                ),
                 "mmproj_path": raw_model.get("mmproj_path"),
                 "default": raw_model.get("default", False),
             }
@@ -353,19 +453,42 @@ def _candidate_settings(payload: Any, current: Settings) -> Settings:
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write a private JSON overlay without following temp-file symlinks."""
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
     encoded = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as output:
             output.write(encoded)
             output.flush()
             os.fsync(output.fileno())
         os.replace(temporary, path)
-    except OSError:
-        temporary.unlink(missing_ok=True)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise
+
+    if os.name == "posix":
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            # Some filesystems do not allow syncing directories. The data file
+            # itself has already been flushed and atomically replaced.
+            pass
 
 
 def _request_is_https(request: Request) -> bool:
@@ -397,7 +520,9 @@ async def auth_options(request: Request) -> Response:
                 and settings.admin_username is not None
                 and settings.admin_password is not None
             ),
-            "api_key_login_enabled": bool(settings.api_auth_enabled and settings.api_key is not None),
+            "api_key_login_enabled": bool(
+                settings.api_auth_enabled and settings.api_key is not None
+            ),
         }
     )
     response.headers["cache-control"] = "no-store"
@@ -426,6 +551,21 @@ async def auth_login(request: Request) -> Response:
             error_type="authentication_error",
             code="admin_auth_not_configured",
         )
+    client_key = request.client.host if request.client is not None else "unknown"
+    limiter: LoginAttemptLimiter | None = getattr(request.app.state, "login_attempt_limiter", None)
+    retry_after = limiter.retry_after(client_key) if limiter is not None else None
+    if retry_after is not None:
+        return _error(
+            "Too many failed sign-in attempts. Wait before trying again.",
+            status_code=429,
+            error_type="authentication_error",
+            code="login_rate_limited",
+            headers={"retry-after": str(retry_after)},
+        )
+    if limiter is not None:
+        # Reserve the attempt before awaiting the request body so concurrent
+        # sign-ins cannot all pass the limit check at once.
+        limiter.record_failure(client_key)
     payload, body_error = await _read_json(request, limit=4096)
     if body_error is not None:
         return body_error
@@ -434,9 +574,7 @@ async def auth_login(request: Request) -> Response:
     api_key_valid = (
         settings.api_key is not None
         and isinstance(supplied_key, str)
-        and hmac.compare_digest(
-            supplied_key.encode("utf-8"), settings.api_key.encode("utf-8")
-        )
+        and hmac.compare_digest(supplied_key.encode("utf-8"), settings.api_key.encode("utf-8"))
     )
     account_valid = verify_admin_credentials(
         credentials.get("username"),
@@ -452,6 +590,8 @@ async def auth_login(request: Request) -> Response:
             code="invalid_api_key",
             headers={"www-authenticate": "Bearer"},
         )
+    if limiter is not None:
+        limiter.clear(client_key)
 
     signing_secret = session_signing_key(
         settings.api_key,
@@ -508,9 +648,10 @@ async def dashboard(_: Request) -> Response:
             "x-content-type-options": "nosniff",
             "referrer-policy": "no-referrer",
             "content-security-policy": (
-                "default-src 'self'; script-src 'self' 'unsafe-inline'; "
-                "style-src 'self' 'unsafe-inline'; connect-src 'self'; "
-                "img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+                f"default-src 'self'; script-src {_SCRIPT_CSP_SOURCES}; "
+                "script-src-attr 'none'; style-src 'self' 'unsafe-inline'; connect-src 'self'; "
+                "img-src 'self' data:; object-src 'none'; base-uri 'none'; "
+                "form-action 'self'; frame-ancestors 'none'"
             ),
         },
     )
@@ -676,7 +817,10 @@ async def install_update(request: Request) -> Response:
                     status_code=409,
                     code="update_source_changed",
                 )
-            output = await install_from_commit(confirmed_commit)
+            output = await install_from_commit(
+                confirmed_commit,
+                api_key_env=settings.api_key_env,
+            )
         except UpdateError as exc:
             return _error(
                 str(exc),
@@ -770,10 +914,13 @@ async def reset_config(request: Request) -> Response:
     async with request.app.state.admin_lock:
         path: Path = request.app.state.admin_config_path
         try:
-            await asyncio.to_thread(path.unlink, missing_ok=True)
+            # Validate the configuration that will remain before deleting the saved
+            # overlay. A malformed base TOML must not erase a working override.
+            validation_path = path.with_name(f".{path.name}.reset-check-{uuid.uuid4().hex}")
             env = dict(os.environ)
-            env["CORTEX_ADMIN_CONFIG"] = str(path)
+            env["CORTEX_ADMIN_CONFIG"] = str(validation_path)
             candidate = Settings.load(environ=env)
+            await asyncio.to_thread(path.unlink, missing_ok=True)
         except (OSError, ConfigurationError) as exc:
             return _error(str(exc), status_code=500, code="config_reset_failed")
         restart_required = [

@@ -9,9 +9,9 @@ unmodified personal, non-commercial use only.
 ## What you need
 
 - Python 3.11 or newer.
-- A local runtime and its model weights. The built-in adapter uses a local
-  `llama-server` executable and GGUF weights. Other runtimes can be launched
-  through the local `command` adapter.
+- A local runtime and its model weights. Choose Cortex's native C++ GGUF host,
+  an external `llama-server`, or another local runtime launched through the
+  `command` adapter. Runtime binaries and weights are installed separately.
 - Disk space for Python dependencies, runtime files, model weights, and temporary
   media uploads. Model weights and runtimes are not included or auto-downloaded
   by Cortex; check their individual license terms.
@@ -31,7 +31,7 @@ local use, in which case no API key is needed.
 You can clone the repository:
 
 ```text
-git clone https://github.com/codero-sus/Cortex_LLMHoster.git
+git clone --branch arena/b3072048-cortex-llmhoster https://github.com/codero-sus/Cortex_LLMHoster.git
 cd Cortex_LLMHoster
 ```
 
@@ -145,13 +145,45 @@ On Windows Command Prompt use `set "2PY2=C:\portable-python\python.exe"`;
 in PowerShell use `Set-Item -Path Env:2PY2 -Value 'C:\portable-python\python.exe'`.
 `2PY2` overrides `python.env`; without either setting, Cortex uses the Python
 that launched it. Cortex re-executes its CLI under the selected interpreter and
-uses it for updater pip installs and the `{python}` local-runtime command
-placeholder. Install Cortex and its dependencies into the selected interpreter
+uses it for the built-in software updater's pip install and the `{python}`
+local-runtime command placeholder. The root-level Git updater does not use
+Python. Install Cortex and its dependencies into the selected interpreter
 first. Paths with spaces may be quoted in `python.env`.
 
 ## 3. Install a local runtime and model
 
-### Built-in llama.cpp runtime
+### Cortex native C++ GGUF backend
+
+This backend runs a Cortex-supervised native C++ process. It loads GGUF through
+the pinned llama.cpp C API, without Python for model loading/inference and
+without the external `llama-server` executable. Build requirements are CMake
+3.24+, Git, a C++17 compiler, and internet access on the first configure to
+fetch pinned dependency sources. Python, pip, and a virtual environment are not
+needed for this backend build.
+
+```bash
+cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON
+cmake --build native/build --target cortex-gguf-host --parallel 2
+```
+
+Then select **Cortex native C++ GGUF backend** in the dashboard (or use
+`runtime = "cortex-cpp"` in TOML). Point `model_path` at a GGUF file to load
+it directly, or a supported local Hugging Face SafeTensors/`pytorch_model.bin`
+model directory for one-time conversion to cached GGUF. Cortex discovers
+`native/build/bin/cortex-gguf-host` automatically; if you install the executable
+elsewhere, add it to `PATH` or set `CORTEX_CPP_HOST` to its path. Conversion is
+optional and uses the upstream llama.cpp Python converter and its dependencies;
+Python is not used for native inference. Legacy pickle-based LLaMA checkpoints
+require an explicit trusted-file opt-in, and arbitrary `.ckpt` files are not
+universally supported. See [`native/README.md`](native/README.md) for format
+limits, converter setup, CUDA, Metal, Vulkan, and tuning options. llama.cpp
+supplies the inference engine; Cortex makes no unbenchmarked speed claim.
+
+Existing configurations may continue to use `runtime = "cortex"`, which runs
+the optional `llama-cpp-python` binding in a managed Python process. New
+installations should choose `cortex-cpp`.
+
+### Managed llama.cpp server runtime
 
 Install a CPU-only or hardware-accelerated llama.cpp build that includes
 `llama-server`. Choose a build matching your OS and hardware, and verify it:
@@ -175,12 +207,18 @@ Install the local engine and weights according to that engine's instructions.
 Configure one model with `runtime = "command"` and an argv array that launches
 its local OpenAI-compatible server. Cortex supplies `{host}` and `{port}` and
 requires the command to bind to `127.0.0.1`; no remote inference URL is accepted.
-The health endpoint configured by `health_path` must return HTTP 2xx.
+The health endpoint configured by `health_path` must return HTTP 2xx. The
+model editor has optional command templates for vLLM, SGLang, TGI, and MLX-LM;
+they only prefill an argv list, so install each engine separately and verify
+its installed flags, API routes, and health endpoint. Review
+[`SERVER_OPTIONS.md`](SERVER_OPTIONS.md) for additional server choices, use
+cases, and example configurations.
 
 ## 4. Configure Cortex
 
 Open `cortex.toml` in a text editor. Replace the example model path with the
-absolute path to a real local GGUF file. The default listener is
+absolute path to a real local GGUF file (or, for `cortex-cpp`, a supported local
+Hugging Face source directory). The default listener is
 `127.0.0.1:8624`, which is accessible from the same computer only.
 
 Example settings:
@@ -347,15 +385,23 @@ your operating system from the repository folder:
 - Windows: double-click `updater.bat` or run it from Command Prompt.
 
 Both scripts verify that the checkout is already on
-`arena/b3072048-cortex-llmhoster`; they never switch to or pull from `main`.
-Before fetching/updating, they copy every repository `*.json` file (excluding
-Git, virtual environments, caches, and prior backups) to
-`backups/json-<timestamp>/`, preserving its relative path. Then they fast-forward
-all tracked files from `origin/arena/b3072048-cortex-llmhoster` and reinstall the
-local project using the selected Python (`2PY2`, `.env`, `python.env`, then the
-current interpreter). Backups are Git-ignored and remain available for manual
-restore. A dirty or divergent branch is not force-reset; resolve or stash local
-changes and rerun. Restart Cortex LLMHoster after the update completes.
+`arena/b3072048-cortex-llmhoster`; they never switch to or update `main`. They
+require Git and network access to GitHub, but do not require Python, pip, or a
+virtual environment. Before changing the checkout, they back up repository
+`*.json` files (excluding Git internals, virtual environments, caches, and prior
+backups) to a uniquely named `backups/json-*/` folder, preserving each relative path. Then
+they run:
+
+```text
+git clone --branch arena/b3072048-cortex-llmhoster https://github.com/codero-sus/Cortex_LLMHoster.git
+```
+
+The clone is temporary; the updater fast-forwards the existing checkout from it
+and removes the temporary clone. No forced reset is used: local edits or
+non-fast-forward history stop the update, leaving the JSON backup available.
+These scripts synchronize source files only and do not install Python package
+changes; install new dependencies separately into the environment used by Cortex
+if a release requires them. Restart Cortex LLMHoster after the update completes.
 
 ## Network access and safety
 

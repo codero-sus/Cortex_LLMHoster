@@ -35,7 +35,8 @@ def _route_path(value: object, field: str, *, trim_trailing_slash: bool = False)
         or path == "/"
         or path.startswith("//")
         or "//" in path
-        or any(char in path for char in "?#\\%")
+        or any(char in path for char in "?#\\%{}")
+        or any(ord(char) < 0x21 or ord(char) == 0x7F for char in path)
         or any(segment in {".", ".."} for segment in path.split("/"))
     ):
         raise ConfigurationError(f"API config {field} is not a safe route path.")
