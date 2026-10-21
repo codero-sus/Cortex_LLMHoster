@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import sys
+from pathlib import Path
 
 import httpx
 import pytest
@@ -64,6 +65,9 @@ async def test_update_check_handles_unavailable_branch() -> None:
 @pytest.mark.asyncio
 async def test_installer_uses_running_interpreter_and_immutable_archive(monkeypatch) -> None:
     calls: dict[str, object] = {}
+    monkeypatch.setenv("CORTEX_API_KEY", "dashboard-key")
+    monkeypatch.setenv("CORTEX_ADMIN_PASSWORD", "dashboard-password")
+    monkeypatch.setenv("CORTEX_CUSTOM_KEY", "custom-dashboard-key")
 
     class FakeProcess:
         returncode = 0
@@ -79,13 +83,18 @@ async def test_installer_uses_running_interpreter_and_immutable_archive(monkeypa
     monkeypatch.setattr(
         "cortex_llmhoster.updater.asyncio.create_subprocess_exec", fake_create_process
     )
-    output = await install_from_commit(COMMIT_SHA)
+    output = await install_from_commit(COMMIT_SHA, api_key_env="CORTEX_CUSTOM_KEY")
 
     args = calls["args"]
     assert args[:3] == (sys.executable, "-m", "pip")
     assert args[3:6] == ("install", "--upgrade", "--no-input")
     assert args[-1] == (f"https://github.com/codero-sus/Cortex_LLMHoster/archive/{COMMIT_SHA}.zip")
-    assert calls["kwargs"]["env"]["PIP_DISABLE_PIP_VERSION_CHECK"] == "1"
+    child_environment = calls["kwargs"]["env"]
+    assert child_environment["PIP_DISABLE_PIP_VERSION_CHECK"] == "1"
+    assert "PATH" in child_environment
+    assert "CORTEX_API_KEY" not in child_environment
+    assert "CORTEX_ADMIN_PASSWORD" not in child_environment
+    assert "CORTEX_CUSTOM_KEY" not in child_environment
     assert "Successfully installed" in output
 
 
@@ -120,3 +129,23 @@ async def test_installer_uses_selected_python_for_pip(monkeypatch) -> None:
 async def test_installer_rejects_untrusted_commit_id_before_starting_pip() -> None:
     with pytest.raises(UpdateError, match="invalid update commit ID"):
         await install_from_commit("https://example.invalid/repo.zip")
+
+
+def test_root_updaters_clone_the_pinned_branch_without_python_installs() -> None:
+    project_root = Path(__file__).resolve().parents[1]
+    expected_branch = "arena/b3072048-cortex-llmhoster"
+    expected_url = "https://github.com/codero-sus/Cortex_LLMHoster.git"
+
+    for filename in ("updater.sh", "updater.bat"):
+        script = (project_root / filename).read_text(encoding="utf-8")
+        clone_position = script.index("git clone --branch")
+        backup_marker = 'find "$PROJECT_ROOT"' if filename.endswith(".sh") else "robocopy"
+        assert script.index(backup_marker) < clone_position
+        assert expected_branch in script
+        assert expected_url in script
+        assert "refs/heads/" in script
+        assert "git merge --ff-only" in script
+        assert "-m pip install" not in script
+        assert "python_runtime" not in script
+        for cache_dir in (".pytest_cache", "__pycache__", "coverage", ".cache"):
+            assert cache_dir in script

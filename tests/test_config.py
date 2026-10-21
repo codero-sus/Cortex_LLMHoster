@@ -13,6 +13,33 @@ def test_default_listener_is_localhost_on_port_8624() -> None:
     assert settings.port == 8624
 
 
+@pytest.mark.parametrize("host", ("localhost", "0.0.0.0", "::", "2001:db8::1", "münchen.example"))
+def test_valid_bind_hosts_are_supported(host: str) -> None:
+    settings = Settings.from_mapping({"server": {"host": host}}, environ={})
+
+    assert settings.host == host
+
+
+@pytest.mark.parametrize(
+    "host",
+    (
+        "",
+        " ",
+        "localhost:8624",
+        "http://localhost",
+        "host/path",
+        "host name",
+        "-bad-host",
+        "bad..host",
+        "[::1]",
+        "host\x00name",
+    ),
+)
+def test_invalid_bind_hosts_fail_during_config_validation(host: str) -> None:
+    with pytest.raises(ConfigurationError, match="IP address or valid DNS hostname"):
+        Settings.from_mapping({"server": {"host": host}}, environ={})
+
+
 def test_api_auth_is_switchable_and_requires_a_key_when_enabled() -> None:
     no_key = Settings.from_mapping({}, environ={})
     key_defaults_to_on = Settings.from_mapping({}, environ={"CORTEX_API_KEY": "local-secret"})
@@ -32,6 +59,50 @@ def test_api_auth_is_switchable_and_requires_a_key_when_enabled() -> None:
         Settings.from_mapping({}, environ={"CORTEX_API_AUTH_ENABLED": "true"})
     with pytest.raises(ConfigurationError, match="must be boolean"):
         Settings.from_mapping({}, environ={"CORTEX_API_AUTH_ENABLED": "sometimes"})
+
+
+@pytest.mark.parametrize(
+    "api_key_env",
+    (
+        "",
+        "9CORTEX_KEY",
+        "CORTEX-KEY",
+        "CORTEX KEY",
+        "CORTEX_ADMIN_PASSWORD",
+        "cortex_admin_password",
+        "CORTEX_API_AUTH_ENABLED",
+    ),
+)
+def test_api_key_environment_name_must_be_a_valid_identifier(api_key_env: str) -> None:
+    with pytest.raises(ConfigurationError, match="valid environment name"):
+        Settings.from_mapping({"server": {"api_key_env": api_key_env}}, environ={})
+
+
+@pytest.mark.parametrize(
+    "settings_kwargs",
+    (
+        {"admin_username": 123, "admin_password": "password"},
+        {"admin_username": "admin", "admin_password": 123},
+    ),
+)
+def test_direct_settings_reject_non_string_dashboard_credentials(settings_kwargs) -> None:
+    with pytest.raises(ConfigurationError, match="must be a string"):
+        Settings(**settings_kwargs)
+
+
+def test_direct_settings_rejects_a_non_string_api_key() -> None:
+    with pytest.raises(ConfigurationError, match="CORTEX_API_KEY must be a string"):
+        Settings(api_key=123)  # type: ignore[arg-type]
+
+
+def test_custom_api_key_environment_falls_back_when_default_variable_is_empty() -> None:
+    settings = Settings.from_mapping(
+        {"server": {"api_key_env": "CORTEX_CUSTOM_KEY"}},
+        environ={"CORTEX_API_KEY": "", "CORTEX_CUSTOM_KEY": "custom-secret"},
+    )
+
+    assert settings.api_key == "custom-secret"
+    assert settings.api_auth_enabled is True
 
 
 def test_dashboard_account_credentials_are_environment_only_and_pair_with_api_key() -> None:
@@ -173,6 +244,142 @@ base_url = "https://example.test/v1"
         Settings.load(config, environ={})
 
 
+@pytest.mark.parametrize("runtime", ("cortex", "cortex-cpp"))
+def test_builtin_cortex_runtime_accepts_local_gguf_text_and_embedding_models(runtime: str) -> None:
+    settings = Settings.from_mapping(
+        {
+            "models": [
+                {
+                    "id": "embedded-gguf",
+                    "runtime": runtime,
+                    "model_path": "/models/embedded.gguf",
+                    "capabilities": ["text_generation", "embeddings"],
+                }
+            ]
+        },
+        environ={},
+    )
+
+    model = settings.models["embedded-gguf"]
+    assert model.runtime == runtime
+    assert model.model_path == "/models/embedded.gguf"
+    assert model.embedding is True
+    assert model.capabilities == ("text_generation", "embeddings")
+
+
+def test_cortex_cpp_accepts_huggingface_directory_and_conversion_precision() -> None:
+    settings = Settings.from_mapping(
+        {
+            "models": [
+                {
+                    "id": "hf-native",
+                    "runtime": "cortex-cpp",
+                    "model_path": "/models/llama-hf-checkpoint",
+                    "capabilities": ["text_generation"],
+                    "conversion_outtype": "q8_0",
+                }
+            ]
+        },
+        environ={},
+    )
+
+    model = settings.models["hf-native"]
+    assert model.model_path == "/models/llama-hf-checkpoint"
+    assert model.conversion_outtype == "q8_0"
+
+
+@pytest.mark.parametrize("outtype", ("auto", "q4_k_m", "", 42))
+def test_cortex_cpp_rejects_unsupported_conversion_outtype(outtype: object) -> None:
+    with pytest.raises(ConfigurationError, match="conversion_outtype"):
+        Settings.from_mapping(
+            {
+                "models": [
+                    {
+                        "id": "native",
+                        "runtime": "cortex-cpp",
+                        "model_path": "/models/native-source",
+                        "conversion_outtype": outtype,
+                    }
+                ]
+            },
+            environ={},
+        )
+
+
+def test_cortex_cpp_unsafe_legacy_conversion_requires_explicit_boolean_opt_in() -> None:
+    base = {
+        "models": [
+            {
+                "id": "native",
+                "runtime": "cortex-cpp",
+                "model_path": "/models/legacy.ckpt",
+            }
+        ]
+    }
+    settings = Settings.from_mapping(base, environ={})
+    assert settings.models["native"].allow_unsafe_legacy_checkpoint_conversion is False
+
+    opted_in = Settings.from_mapping(
+        {
+            "models": [
+                {
+                    **base["models"][0],
+                    "allow_unsafe_legacy_checkpoint_conversion": True,
+                }
+            ]
+        },
+        environ={},
+    )
+    assert opted_in.models["native"].allow_unsafe_legacy_checkpoint_conversion is True
+
+    with pytest.raises(ConfigurationError, match="must be booleans"):
+        Settings.from_mapping(
+            {
+                "models": [
+                    {
+                        **base["models"][0],
+                        "allow_unsafe_legacy_checkpoint_conversion": "true",
+                    }
+                ]
+            },
+            environ={},
+        )
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"model_path": None},
+        {"model_path": "/models/not-gguf/"},
+        {"model_path": "/models/vision.gguf", "mmproj_path": "/models/mmproj.gguf"},
+        {"model_path": "/models/audio.gguf", "capabilities": ["audio_transcription"]},
+    ),
+)
+def test_legacy_cortex_runtime_rejects_unsupported_model_requirements(extra) -> None:
+    model = {
+        "id": "embedded-gguf",
+        "runtime": "cortex",
+        "model_path": "/models/embedded.gguf",
+        **extra,
+    }
+    with pytest.raises(ConfigurationError):
+        Settings.from_mapping({"models": [model]}, environ={})
+
+
+@pytest.mark.parametrize(
+    "extra",
+    (
+        {"model_path": None},
+        {"model_path": "/models/vision.gguf", "mmproj_path": "/models/mmproj.gguf"},
+        {"model_path": "/models/audio", "capabilities": ["audio_transcription"]},
+    ),
+)
+def test_cortex_cpp_rejects_missing_or_unsupported_model_requirements(extra) -> None:
+    model = {"id": "native", "runtime": "cortex-cpp", "model_path": "/models/source", **extra}
+    with pytest.raises(ConfigurationError):
+        Settings.from_mapping({"models": [model]}, environ={})
+
+
 def test_inference_request_limit_is_configurable_and_bounded_by_connection_pool() -> None:
     settings = Settings.from_mapping(
         {"server": {"max_connections": 4, "max_inference_requests": 3}},
@@ -194,6 +401,78 @@ def test_inference_request_limit_is_configurable_and_bounded_by_connection_pool(
             {"server": {"max_connections": 2, "max_inference_requests": 3}},
             environ={},
         )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("port", True),
+        ("port", 8080.5),
+        ("workers", True),
+        ("workers", 2.5),
+        ("max_connections", True),
+        ("max_connections", 10.5),
+        ("max_keepalive_connections", True),
+        ("max_keepalive_connections", 10.5),
+        ("max_inference_requests", True),
+        ("max_inference_requests", 10.5),
+        ("max_json_body_bytes", True),
+        ("max_json_body_bytes", 1024.5),
+        ("max_media_body_bytes", True),
+        ("max_media_body_bytes", 1024.5),
+    ],
+)
+def test_server_integer_settings_reject_booleans_and_fractional_numbers(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ConfigurationError):
+        Settings.from_mapping({"server": {field: value}}, environ={})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        (field, 1.5)
+        for field in (
+            "threads",
+            "threads_batch",
+            "gpu_layers",
+            "context_size",
+            "batch_size",
+            "ubatch_size",
+            "parallel",
+        )
+    ],
+)
+def test_model_integer_settings_reject_fractional_numbers(field: str, value: object) -> None:
+    with pytest.raises(ConfigurationError, match="must be an integer"):
+        Settings.from_mapping(
+            {
+                "models": [
+                    {
+                        "id": "local",
+                        "model_path": "/models/local.gguf",
+                        field: value,
+                    }
+                ]
+            },
+            environ={},
+        )
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "connect_timeout",
+        "read_timeout",
+        "write_timeout",
+        "pool_timeout",
+        "keepalive_expiry",
+    ),
+)
+def test_timeout_settings_reject_boolean_values(field: str) -> None:
+    with pytest.raises(ConfigurationError):
+        Settings.from_mapping({"server": {field: True}}, environ={})
 
 
 def test_invalid_optimization_level_is_rejected() -> None:

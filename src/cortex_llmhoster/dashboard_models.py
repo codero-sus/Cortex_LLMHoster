@@ -15,6 +15,7 @@ from starlette.requests import ClientDisconnect, Request
 from starlette.responses import Response
 
 from .config import Settings
+from .http_utils import content_length_from_headers
 from .model_discovery import detect_model_capabilities, discover_local_model_files
 from .responses import OrjsonResponse
 from .responses import error_response as _error
@@ -37,7 +38,6 @@ def _safe_model_filename(value: str) -> str | None:
 
     if (
         not value
-        or len(value.encode("utf-8", errors="ignore")) > 240
         or value in {".", ".."}
         or value != value.strip()
         or any(character in value for character in '<>:/\\|?*"')
@@ -45,6 +45,20 @@ def _safe_model_filename(value: str) -> str | None:
         or value.endswith((".", " "))
         or Path(value).suffix.casefold() != ".gguf"
     ):
+        return None
+    try:
+        if len(value.encode("utf-8", errors="strict")) > 240:
+            return None
+    except UnicodeEncodeError:
+        return None
+    if value.split(".", 1)[0].rstrip(" .").upper() in {
+        "CON",
+        "PRN",
+        "AUX",
+        "NUL",
+        *(f"COM{number}" for number in range(1, 10)),
+        *(f"LPT{number}" for number in range(1, 10)),
+    }:
         return None
     return value
 
@@ -54,9 +68,7 @@ def _writable_model_directory() -> Path:
 
     configured = os.environ.get("CORTEX_MODELS_DIR", "")
     candidates = [
-        Path(value.strip()).expanduser()
-        for value in configured.split(os.pathsep)
-        if value.strip()
+        Path(value.strip()).expanduser() for value in configured.split(os.pathsep) if value.strip()
     ]
     candidates.extend((Path.home() / "models", Path.cwd() / "models"))
     seen: set[Path] = set()
@@ -71,7 +83,7 @@ def _writable_model_directory() -> Path:
             os.close(descriptor)
             Path(probe).unlink()
             return root
-        except OSError:
+        except (OSError, RuntimeError):
             continue
     raise OSError(
         "No writable model folder is available. Set CORTEX_MODELS_DIR to a writable folder."
@@ -167,11 +179,12 @@ async def upload_model_file(request: Request) -> Response:
             code="invalid_model_upload_type",
         )
 
-    raw_length = request.headers.get("content-length")
     try:
-        expected_length = int(raw_length) if raw_length is not None else None
+        expected_length = content_length_from_headers(request.headers)
     except ValueError:
-        return _error("Invalid Content-Length header.", status_code=400)
+        return _error(
+            "Invalid Content-Length header.", status_code=400, code="invalid_content_length"
+        )
     if expected_length is not None and expected_length < len(_GGUF_MAGIC):
         return _error("The selected file is too small to be a GGUF model.", status_code=422)
 
@@ -231,10 +244,24 @@ async def upload_model_file(request: Request) -> Response:
                         status_code=422,
                         code="invalid_gguf_file",
                     )
-            buffer.extend(chunk)
-            if len(buffer) >= _UPLOAD_WRITE_CHUNK_BYTES:
-                await asyncio.to_thread(target.write, buffer)
-                buffer.clear()
+            # ASGI servers may yield very large chunks; do not duplicate one
+            # into the bounded write buffer before flushing it to disk.
+            chunk_view = memoryview(chunk)
+            offset = 0
+            while offset < len(chunk_view):
+                remaining = len(chunk_view) - offset
+                capacity = _UPLOAD_WRITE_CHUNK_BYTES - len(buffer)
+                if buffer or remaining < _UPLOAD_WRITE_CHUNK_BYTES:
+                    count = min(capacity, remaining)
+                    buffer.extend(chunk_view[offset : offset + count])
+                    offset += count
+                    if len(buffer) == _UPLOAD_WRITE_CHUNK_BYTES:
+                        await asyncio.to_thread(target.write, buffer)
+                        buffer.clear()
+                else:
+                    end = offset + _UPLOAD_WRITE_CHUNK_BYTES
+                    await asyncio.to_thread(target.write, chunk_view[offset:end])
+                    offset = end
 
         if len(header) < len(_GGUF_MAGIC):
             raise _UploadRejected(

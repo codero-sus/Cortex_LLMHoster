@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -230,3 +231,151 @@ HTTPServer((host, port), Handler).serve_forever()
 
     assert response.status_code == 200
     assert response.json() == {"path": "/v1/ocr", "model": "ocr-engine-alias"}
+
+
+@pytest.mark.asyncio
+async def test_builtin_cortex_runtime_uses_openai_gateway_routing_without_llama_server(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model_path = tmp_path / "embedded.gguf"
+    model_path.write_bytes(b"GGUF test fixture")
+    model = ModelConfig(
+        id="embedded-local",
+        upstream_model="embedded-engine-alias",
+        runtime="cortex",
+        model_path=str(model_path),
+        capabilities=("text_generation",),
+    )
+    observed: dict[str, object] = {}
+
+    async def mock_backend(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        observed["url"] = str(request.url)
+        observed["body"] = await request.aread()
+        return httpx.Response(200, json={"id": "embedded-result", "choices": []})
+
+    monkeypatch.setattr(
+        "cortex_llmhoster.runtime.build_cortex_runtime_command",
+        lambda _model, _port: [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    app = create_app(
+        Settings(models={model.id: model}, default_model=model.id),
+        transport=httpx.MockTransport(mock_backend),
+    )
+
+    async with open_client(app) as client:
+        manager = app.state.runtime_manager
+        for _ in range(60):
+            if manager.state(model.id)["status"] == "running":
+                break
+            await asyncio.sleep(0.05)
+        state = manager.state(model.id)
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": model.id, "messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        assert state["status"] == "running"
+        assert state["runtime"] == "cortex"
+        assert state["base_url"] == f"http://127.0.0.1:{state['port']}/v1"
+        stopped = await manager.stop(model.id)
+        assert stopped["status"] == "stopped"
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "embedded-result"
+    assert str(observed["url"]).startswith("http://127.0.0.1:")
+    assert str(observed["url"]).endswith("/v1/chat/completions")
+    assert b"embedded-engine-alias" in observed["body"]
+
+
+@pytest.mark.asyncio
+async def test_native_cortex_cpp_runtime_uses_gateway_without_python_or_llama_server(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model_path = tmp_path / "native.gguf"
+    model_path.write_bytes(b"GGUF test fixture")
+    model = ModelConfig(
+        id="native-local",
+        upstream_model="native-engine-alias",
+        runtime="cortex-cpp",
+        model_path=str(model_path),
+        capabilities=("text_generation",),
+    )
+    observed: dict[str, object] = {}
+
+    async def mock_backend(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        observed["url"] = str(request.url)
+        observed["body"] = await request.aread()
+        return httpx.Response(200, json={"id": "native-result", "choices": []})
+
+    monkeypatch.setattr(
+        "cortex_llmhoster.runtime._resolve_cortex_cpp_binary", lambda: "/opt/cortex-gguf-host"
+    )
+
+    class FakeProcess:
+        returncode: int | None = None
+        pid = 2468
+        stdout = None
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    async def fake_create_subprocess(*args: object, **kwargs: object) -> FakeProcess:
+        observed["command"] = args
+        observed["spawn_options"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "cortex_llmhoster.runtime.asyncio.create_subprocess_exec", fake_create_subprocess
+    )
+    app = create_app(
+        Settings(models={model.id: model}, default_model=model.id),
+        transport=httpx.MockTransport(mock_backend),
+    )
+
+    async with open_client(app) as client:
+        manager = app.state.runtime_manager
+        for _ in range(60):
+            if manager.state(model.id)["status"] == "running":
+                break
+            await asyncio.sleep(0.05)
+        state = manager.state(model.id)
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": model.id,
+                "messages": [{"role": "user", "content": "hello"}],
+                "frequency_penalty": 0.4,
+                "presence_penalty": -0.2,
+            },
+        )
+        assert state["status"] == "running"
+        assert state["runtime"] == "cortex-cpp"
+        assert state["base_url"] == f"http://127.0.0.1:{state['port']}/v1"
+        native_command = observed["command"]
+        assert native_command[0] == "/opt/cortex-gguf-host"
+        assert "python" not in native_command[0].lower()
+        assert "llama-server" not in native_command[0]
+        assert native_command[native_command.index("--model-path") + 1] == str(model_path)
+        stopped = await manager.stop(model.id)
+        assert stopped["status"] == "stopped"
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "native-result"
+    assert str(observed["url"]).startswith("http://127.0.0.1:")
+    assert str(observed["url"]).endswith("/v1/chat/completions")
+    forwarded = json.loads(observed["body"])
+    assert forwarded["model"] == "native-engine-alias"
+    assert forwarded["frequency_penalty"] == 0.4
+    assert forwarded["presence_penalty"] == -0.2

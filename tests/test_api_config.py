@@ -47,3 +47,21 @@ def test_api_config_rejects_unsupported_format_and_reserved_routes(tmp_path) -> 
     path.write_text('{"format":"openai","base_path":"/admin/v1"}', encoding="utf-8")
     with pytest.raises(ConfigurationError, match="reserved Cortex route"):
         APIFormatConfig.load(path)
+
+
+@pytest.mark.parametrize(
+    "route_overrides",
+    (
+        {"base_path": "/v{version}"},
+        {"models_path": "/models/{model_id}"},
+        {"base_path": "/v1\u0001"},
+    ),
+)
+def test_api_config_rejects_dynamic_or_control_character_route_paths(
+    tmp_path, route_overrides
+) -> None:
+    path = tmp_path / "api.json"
+    path.write_text(json.dumps(route_overrides), encoding="utf-8")
+
+    with pytest.raises(ConfigurationError, match="safe route path"):
+        APIFormatConfig.load(path)

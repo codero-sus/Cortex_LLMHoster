@@ -76,6 +76,34 @@ def test_cli_no_api_auth_flag_runs_without_a_key(flag, tmp_path, monkeypatch) ->
     assert observed["port"] == 8624
 
 
+@pytest.mark.parametrize("host", ("", "http://localhost", "host/path"))
+def test_cli_rejects_invalid_host_overrides(host, tmp_path, monkeypatch) -> None:
+    monkeypatch.setattr(cli.python_runtime, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "reexec_with_selected_python", lambda: None)
+    monkeypatch.setattr(cli.Settings, "load", lambda: Settings())
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: pytest.fail("server started"))
+    monkeypatch.setattr(sys, "argv", ["cortex-llmhoster", "--host", host])
+
+    with pytest.raises(SystemExit, match="2"):
+        cli.main()
+
+
+def test_cli_warns_when_binding_all_interfaces_without_authentication(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    monkeypatch.setattr(cli.python_runtime, "_project_root", lambda: tmp_path)
+    monkeypatch.setattr(cli, "reexec_with_selected_python", lambda: None)
+    monkeypatch.setattr(cli.Settings, "load", lambda: Settings(api_auth_enabled=False))
+    monkeypatch.setattr(uvicorn, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(sys, "argv", ["cortex-llmhoster", "--host", "0.0.0.0"])
+
+    cli.main()
+
+    assert (
+        "listening on all network interfaces without API authentication" in capsys.readouterr().err
+    )
+
+
 def test_cli_uses_default_port_8624(monkeypatch) -> None:
     monkeypatch.delenv("CORTEX_WORKERS", raising=False)
     observed: dict[str, object] = {}

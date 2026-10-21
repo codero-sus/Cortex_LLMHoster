@@ -1,15 +1,25 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import stat
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import httpx
+import orjson
 import pytest
+from starlette.requests import ClientDisconnect, Request
 
 from cortex_llmhoster.app import create_app
 from cortex_llmhoster.config import ModelConfig, Settings
+from cortex_llmhoster.dashboard import (
+    LoginAttemptLimiter,
+    _inline_script_hashes,
+    _read_json,
+    _write_json,
+)
 
 
 @asynccontextmanager
@@ -22,6 +32,36 @@ async def open_client(app) -> AsyncIterator[httpx.AsyncClient]:
         ) as client,
     ):
         yield client
+
+
+@pytest.mark.asyncio
+async def test_admin_json_reader_reports_client_disconnect_as_a_bad_request() -> None:
+    async def disconnected_receive():
+        raise ClientDisconnect
+
+    request = Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/admin/api/config",
+            "raw_path": b"/admin/api/config",
+            "query_string": b"",
+            "headers": [],
+            "client": ("testclient", 123),
+            "server": ("testserver", 80),
+        },
+        receive=disconnected_receive,
+    )
+
+    payload, error = await _read_json(request)
+
+    assert payload is None
+    assert error is not None
+    assert error.status_code == 400
+    assert orjson.loads(error.body)["error"]["code"] == "request_body_interrupted"
 
 
 def admin_headers() -> dict[str, str]:
@@ -83,10 +123,10 @@ async def test_authenticated_updater_checks_and_installs_pinned_branch(
         transport=update_metadata_transport("0.3.0"),
         admin_config_path=tmp_path / "config.json",
     )
-    installed: list[str] = []
+    installed: list[tuple[str, str]] = []
 
-    async def fake_install(commit_sha: str) -> str:
-        installed.append(commit_sha)
+    async def fake_install(commit_sha: str, *, api_key_env: str) -> str:
+        installed.append((commit_sha, api_key_env))
         return "Successfully installed cortex-llmhoster"
 
     monkeypatch.setattr("cortex_llmhoster.dashboard.install_from_commit", fake_install)
@@ -104,7 +144,7 @@ async def test_authenticated_updater_checks_and_installs_pinned_branch(
     assert result.status_code == 200
     assert result.json()["installed_version"] == "0.3.0"
     assert result.json()["restart_required"] is True
-    assert installed == ["b" * 40]
+    assert installed == [("b" * 40, "CORTEX_API_KEY")]
 
 
 @pytest.mark.asyncio
@@ -158,6 +198,14 @@ async def test_dashboard_is_served_and_auth_enabled_requires_key(tmp_path) -> No
         state = await client.get("/admin/api/state")
 
     assert page.status_code == 200
+    content_security_policy = page.headers["content-security-policy"]
+    script_policy = content_security_policy.split("script-src ", 1)[1].split(";", 1)[0]
+    assert "'unsafe-inline'" not in script_policy
+    script_hashes = _inline_script_hashes(page.text)
+    assert script_hashes
+    assert all(source_hash in script_policy for source_hash in script_hashes)
+    assert "script-src-attr 'none'" in content_security_policy
+    assert "form-action 'self'" in content_security_policy
     assert "Cortex LLMHoster — Free Local Model Hoster" in page.text
     assert "https://github.com/codero-sus" in page.text
     assert "https://the-codero.web.app/" in page.text
@@ -170,6 +218,11 @@ async def test_dashboard_is_served_and_auth_enabled_requires_key(tmp_path) -> No
     assert "Use a GGUF already on this Cortex server" in page.text
     assert "/admin/api/models/files/upload" in page.text
     assert "xhr.send(file)" in page.text
+    assert 'id="connection-action"' in page.text
+    assert "Server offline" in page.text
+    assert "Open docs" in page.text
+    assert "error.status=401" in page.text
+    assert "event.isComposing" in page.text
     assert 'id="model-file-select"' in page.text
     assert 'id="manual-model-path-toggle"' in page.text
     assert "Enter a model path manually" in page.text
@@ -191,6 +244,22 @@ async def test_dashboard_is_served_and_auth_enabled_requires_key(tmp_path) -> No
     for mode in ("Low−", "Low+", "Medium−", "Medium+", "High−", "High+"):
         assert mode in page.text
     assert "{python}" in page.text
+    assert 'id="server-profile-field"' in page.text
+    assert "vLLM · GPU throughput and batching" in page.text
+    assert "SGLang · high-throughput serving" in page.text
+    assert "Cortex native C++ GGUF backend" in page.text
+    assert "cortex-cpp" in page.text
+    assert "conversion_outtype" in page.text
+    assert "allow_unsafe_legacy_checkpoint_conversion" in page.text
+    assert "Pickle-based checkpoints can execute code" in page.text
+    assert "CORTEX_CPP_HOST" in page.text
+    assert 'id="frequency-penalty"' in page.text
+    assert 'id="presence-penalty"' in page.text
+    assert "frequency_penalty:Number" in page.text
+    assert "presence_penalty:Number" in page.text
+    assert "Hugging Face TGI · Transformers serving" in page.text
+    assert "MLX-LM · Apple Silicon" in page.text
+    assert "Templates only prefill commands" in page.text
     assert 'aria-labelledby="dialog-title"' in page.text
     assert "Local admin username" in page.text
     assert "Use API key instead" in page.text
@@ -207,10 +276,27 @@ async def test_dashboard_is_served_and_auth_enabled_requires_key(tmp_path) -> No
 
 
 @pytest.mark.asyncio
+async def test_admin_api_responses_are_never_cached(tmp_path) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        responses = [
+            await client.get("/admin/api/auth/options"),
+            await client.get("/admin/api/state", headers=admin_headers()),
+            await client.get("/admin/api/metrics", headers=admin_headers()),
+            await client.get("/admin/api/config/export", headers=admin_headers()),
+            await client.get("/admin/api/state"),
+        ]
+
+    assert [response.status_code for response in responses] == [200, 200, 200, 200, 401]
+    for response in responses:
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["pragma"] == "no-cache"
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
 async def test_disabled_auth_allows_admin_and_inference_without_a_key(tmp_path) -> None:
-    app = create_app(
-        Settings(api_auth_enabled=False), admin_config_path=tmp_path / "config.json"
-    )
+    app = create_app(Settings(api_auth_enabled=False), admin_config_path=tmp_path / "config.json")
     async with open_client(app) as client:
         state = await client.get("/admin/api/state")
         models = await client.get("/v1/models")
@@ -221,20 +307,85 @@ async def test_disabled_auth_allows_admin_and_inference_without_a_key(tmp_path) 
     assert models.json()["data"] == []
 
 
+@pytest.mark.parametrize("content_length", ("-1", "+1", "1.0", "1, 1", "not-a-number", ""))
+@pytest.mark.asyncio
+async def test_admin_json_reader_rejects_invalid_content_length(
+    tmp_path, content_length: str
+) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        response = await client.post(
+            "/admin/api/auth/login",
+            content=b"{}",
+            headers={"content-type": "application/json", "content-length": content_length},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Invalid Content-Length header."
+
+
+@pytest.mark.asyncio
+async def test_login_endpoint_throttles_repeated_invalid_credentials(tmp_path) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        failures = [
+            await client.post("/admin/api/auth/login", json={"api_key": "wrong-key"})
+            for _ in range(10)
+        ]
+        blocked = await client.post("/admin/api/auth/login", json={"api_key": "dashboard-secret"})
+
+    assert all(response.status_code == 401 for response in failures)
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "login_rate_limited"
+    assert int(blocked.headers["retry-after"]) >= 1
+
+
+@pytest.mark.asyncio
+async def test_login_rate_limit_reserves_concurrent_attempts_before_body_parsing(tmp_path) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        responses = await asyncio.gather(
+            *(
+                client.post("/admin/api/auth/login", json={"api_key": "wrong-key"})
+                for _ in range(20)
+            )
+        )
+
+    assert sum(response.status_code == 401 for response in responses) == 10
+    assert sum(response.status_code == 429 for response in responses) == 10
+    assert all(
+        response.json()["error"]["code"] == "login_rate_limited"
+        for response in responses
+        if response.status_code == 429
+    )
+
+
+def test_login_attempt_limiter_expires_old_failures_and_bounds_client_storage() -> None:
+    limiter = LoginAttemptLimiter(max_attempts=2, window_seconds=10, max_clients=2)
+    limiter.record_failure("client-a", now=1)
+    assert limiter.retry_after("client-a", now=1) is None
+    limiter.record_failure("client-a", now=2)
+    assert limiter.retry_after("client-a", now=2) == 9
+    assert limiter.retry_after("client-a", now=11) is None
+
+    limiter.record_failure("client-b", now=20)
+    limiter.record_failure("client-c", now=21)
+    assert len(limiter._failures) == 2
+    assert limiter.retry_after("client-a", now=21) is None
+
+
 @pytest.mark.asyncio
 async def test_dashboard_login_sets_persistent_http_only_session_cookie(tmp_path) -> None:
     app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
     async with open_client(app) as client:
         options = await client.get("/admin/api/auth/options")
-        invalid = await client.post(
-            "/admin/api/auth/login", json={"api_key": "not-the-key"}
-        )
-        login = await client.post(
-            "/admin/api/auth/login", json={"api_key": "dashboard-secret"}
-        )
+        invalid = await client.post("/admin/api/auth/login", json={"api_key": "not-the-key"})
+        login = await client.post("/admin/api/auth/login", json={"api_key": "dashboard-secret"})
         state = await client.get("/admin/api/state")
         inference_models = await client.get("/v1/models")
-        logout = await client.post("/admin/api/auth/logout")
+        logout = await client.post(
+            "/admin/api/auth/logout", headers={"origin": "http://cortex.test"}
+        )
         denied_after_logout = await client.get("/admin/api/state")
 
     cookie = login.headers["set-cookie"]
@@ -278,7 +429,7 @@ async def test_account_login_issues_session_and_bearer_api_key_remains_supported
         )
         state = await client.get("/admin/api/state")
         inference_models = await client.get("/v1/models")
-        await client.post("/admin/api/auth/logout")
+        await client.post("/admin/api/auth/logout", headers={"origin": "http://cortex.test"})
         bearer_state = await client.get("/admin/api/state", headers=admin_headers())
 
     cookie = login.headers["set-cookie"]
@@ -323,9 +474,7 @@ async def test_https_dashboard_cookie_supports_embedded_preview_and_partitioning
 async def test_cross_origin_cookie_mutation_is_rejected(tmp_path) -> None:
     app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
     async with open_client(app) as client:
-        login = await client.post(
-            "/admin/api/auth/login", json={"api_key": "dashboard-secret"}
-        )
+        login = await client.post("/admin/api/auth/login", json={"api_key": "dashboard-secret"})
         csrf = await client.post(
             "/admin/api/auth/logout", headers={"origin": "https://attacker.invalid"}
         )
@@ -335,6 +484,109 @@ async def test_cross_origin_cookie_mutation_is_rejected(tmp_path) -> None:
     assert csrf.status_code == 403
     assert csrf.json()["error"]["code"] == "csrf_origin_rejected"
     assert still_authenticated.status_code == 200
+
+
+@pytest.mark.parametrize(
+    ("headers", "expected_status"),
+    [
+        ({"origin": "http://cortex.test"}, 200),
+        ({"origin": "http://CORTEX.TEST:80"}, 200),
+        ({"referer": "http://cortex.test/settings"}, 200),
+        ({"sec-fetch-site": "same-origin"}, 200),
+        (
+            {
+                "origin": "https://preview.cortex.test",
+                "x-forwarded-proto": "https",
+                "x-forwarded-host": "preview.cortex.test",
+            },
+            200,
+        ),
+        ({}, 403),
+        ({"sec-fetch-site": "same-site"}, 403),
+        ({"sec-fetch-site": "cross-site"}, 403),
+        ({"origin": "null"}, 403),
+        ({"origin": "http://cortex.test/settings"}, 403),
+        ({"origin": "http://attacker.invalid"}, 403),
+        ({"referer": "https://attacker.invalid/"}, 403),
+        ({"origin": "http://[invalid"}, 403),
+    ],
+)
+@pytest.mark.asyncio
+async def test_cookie_mutations_require_verifiable_same_origin_metadata(
+    tmp_path, headers: dict[str, str], expected_status: int
+) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    async with open_client(app) as client:
+        login = await client.post("/admin/api/auth/login", json={"api_key": "dashboard-secret"})
+        mutation = await client.post("/admin/api/auth/logout", headers=headers)
+
+    assert login.status_code == 200
+    assert mutation.status_code == expected_status
+    if expected_status == 403:
+        assert mutation.json()["error"]["code"] == "csrf_origin_rejected"
+
+
+def test_atomic_config_write_ignores_predictable_temp_symlinks_and_sets_private_mode(
+    tmp_path,
+) -> None:
+    destination = tmp_path / "cortex.local.json"
+    victim = tmp_path / "must-not-be-overwritten.txt"
+    victim.write_text("keep this file", encoding="utf-8")
+    predictable_temp = tmp_path / f".{destination.name}.tmp"
+    try:
+        predictable_temp.symlink_to(victim)
+    except (NotImplementedError, OSError) as exc:
+        pytest.skip(f"symlink creation is unavailable: {exc}")
+
+    _write_json(destination, {"server": {"port": 9000}})
+
+    assert json.loads(destination.read_text(encoding="utf-8")) == {"server": {"port": 9000}}
+    assert victim.read_text(encoding="utf-8") == "keep this file"
+    assert stat.S_IMODE(destination.stat().st_mode) == 0o600
+    assert predictable_temp.is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_reset_config_validates_base_before_removing_saved_overlay(
+    tmp_path, monkeypatch
+) -> None:
+    base_config = tmp_path / "broken.toml"
+    base_config.write_text("[server\nport = 9000\n", encoding="utf-8")
+    monkeypatch.setenv("CORTEX_CONFIG", str(base_config))
+    monkeypatch.delenv("CORTEX_API_KEY", raising=False)
+    overlay = tmp_path / "cortex.local.json"
+    original_overlay = b'{"server":{"port":9100},"models":[]}\n'
+    overlay.write_bytes(original_overlay)
+    app = create_app(configured_settings(), admin_config_path=overlay)
+
+    async with open_client(app) as client:
+        response = await client.post("/admin/api/config/reset", headers=admin_headers())
+
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "config_reset_failed"
+    assert overlay.read_bytes() == original_overlay
+    assert app.state.settings.port == configured_settings().port
+
+
+@pytest.mark.asyncio
+async def test_reset_config_removes_overlay_after_valid_base_is_loaded(
+    tmp_path, monkeypatch
+) -> None:
+    base_config = tmp_path / "base.toml"
+    base_config.write_text("[server]\nport = 9123\napi_auth_enabled = false\n", encoding="utf-8")
+    monkeypatch.setenv("CORTEX_CONFIG", str(base_config))
+    monkeypatch.delenv("CORTEX_API_KEY", raising=False)
+    overlay = tmp_path / "cortex.local.json"
+    overlay.write_text('{"server":{"port":9100},"models":[]}', encoding="utf-8")
+    app = create_app(configured_settings(), admin_config_path=overlay)
+
+    async with open_client(app) as client:
+        response = await client.post("/admin/api/config/reset", headers=admin_headers())
+
+    assert response.status_code == 200
+    assert response.json()["server"]["port"] == 9123
+    assert not overlay.exists()
+    assert app.state.settings.port == 9123
 
 
 @pytest.mark.asyncio
@@ -348,9 +600,7 @@ async def test_auth_toggle_persists_without_writing_the_local_secret(tmp_path) -
         payload["server"]["api_auth_enabled"] = True
         saved = await client.put("/admin/api/config", json=payload)
         denied = await client.get("/admin/api/state")
-        login = await client.post(
-            "/admin/api/auth/login", json={"api_key": "dashboard-secret"}
-        )
+        login = await client.post("/admin/api/auth/login", json={"api_key": "dashboard-secret"})
         authorized = await client.get("/admin/api/state")
 
     saved_json = config_path.read_text(encoding="utf-8")
@@ -454,9 +704,7 @@ async def test_live_hugging_face_catalog_is_bounded_and_has_offline_fallback(tmp
         admin_config_path=tmp_path / "config.json",
     )
     async with open_client(app) as client:
-        invalid_task = await client.get(
-            "/admin/api/cookbook?source=huggingface&task=not-a-task"
-        )
+        invalid_task = await client.get("/admin/api/cookbook?source=huggingface&task=not-a-task")
         long_query = await client.get(f"/admin/api/cookbook?source=huggingface&q={'x' * 121}")
         unavailable = await client.get("/admin/api/cookbook?source=huggingface")
         curated = await client.get("/admin/api/cookbook?source=curated")
@@ -606,6 +854,38 @@ async def test_local_model_fields_round_trip_through_dashboard(tmp_path) -> None
     assert exported.json()["models"][0]["optimization_level"] == 0
     assert exported.json()["models"][0]["optimization_preset"] == "medium_plus"
     assert exported.json()["models"][0]["embedding"] is True
+
+
+@pytest.mark.asyncio
+async def test_cortex_cpp_conversion_settings_round_trip_through_dashboard(tmp_path) -> None:
+    local_config = tmp_path / "cortex.local.json"
+    app = create_app(configured_settings(), admin_config_path=local_config)
+    payload = {
+        "server": {"default_model": "native-local", "workers": 1},
+        "models": [
+            {
+                "id": "native-local",
+                "runtime": "cortex-cpp",
+                "model_path": "/models/hf-checkpoint",
+                "conversion_outtype": "q8_0",
+                "allow_unsafe_legacy_checkpoint_conversion": True,
+                "default": True,
+            }
+        ],
+    }
+
+    async with open_client(app) as client:
+        saved = await client.put("/admin/api/config", headers=admin_headers(), json=payload)
+        state = await client.get("/admin/api/state", headers=admin_headers())
+        exported = await client.get("/admin/api/config/export", headers=admin_headers())
+
+    assert saved.status_code == 200
+    assert state.json()["models"][0]["conversion_outtype"] == "q8_0"
+    assert state.json()["models"][0]["allow_unsafe_legacy_checkpoint_conversion"] is True
+    assert exported.json()["models"][0]["allow_unsafe_legacy_checkpoint_conversion"] is True
+    stored_model = json.loads(local_config.read_text(encoding="utf-8"))["models"][0]
+    assert stored_model["conversion_outtype"] == "q8_0"
+    assert stored_model["allow_unsafe_legacy_checkpoint_conversion"] is True
 
 
 @pytest.mark.asyncio
@@ -803,7 +1083,31 @@ async def test_model_file_upload_requires_admin_auth_and_streams_to_local_storag
 
 
 @pytest.mark.asyncio
-async def test_model_file_upload_rejects_unsafe_names_and_non_gguf_data(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("content_length", ("-1", "+1", "1.0", "1, 1"))
+async def test_model_file_upload_rejects_invalid_content_length(tmp_path, content_length) -> None:
+    app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
+    headers = {
+        **admin_headers(),
+        "Content-Type": "application/octet-stream",
+        "Content-Length": content_length,
+    }
+
+    async with open_client(app) as client:
+        response = await client.post(
+            "/admin/api/models/files/upload",
+            params={"filename": "local.gguf"},
+            content=b"GGUF fixture",
+            headers=headers,
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_content_length"
+
+
+@pytest.mark.asyncio
+async def test_model_file_upload_rejects_unsafe_names_and_non_gguf_data(
+    tmp_path, monkeypatch
+) -> None:
     monkeypatch.setenv("CORTEX_MODELS_DIR", str(tmp_path / "models"))
     app = create_app(configured_settings(), admin_config_path=tmp_path / "config.json")
     headers = {**admin_headers(), "Content-Type": "application/octet-stream"}
@@ -876,7 +1180,5 @@ async def test_capability_detection_suggests_tasks_from_local_gguf_metadata(tmp_
 
     assert denied.status_code == 401
     assert response.status_code == 200
-    assert {"vision_understanding", "text_generation"}.issubset(
-        response.json()["capabilities"]
-    )
+    assert {"vision_understanding", "text_generation"}.issubset(response.json()["capabilities"])
     assert "best-effort" in response.json()["note"].lower()

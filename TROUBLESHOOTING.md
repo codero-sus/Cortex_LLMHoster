@@ -72,6 +72,37 @@ The OS/model runtime and model weights are installed separately.
 - Confirm that the executable is for your OS and that the GPU build, if used,
   supports your installed driver/device. CPU-only llama.cpp builds are valid.
 
+### Cortex native C++ host or source conversion is unavailable
+
+- Build the host from the repository with CMake, Git, and a C++17 compiler:
+  `cmake -S native -B native/build -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=ON`
+  followed by `cmake --build native/build --target cortex-gguf-host --parallel 2`.
+  The default executable path is `native/build/bin/cortex-gguf-host`.
+- If the executable is elsewhere, put it on `PATH` or set `CORTEX_CPP_HOST` to
+  its full path. It must be executable by the Cortex service account.
+- Direct GGUF needs no converter. For HF SafeTensors or `pytorch_model.bin`,
+  point `model_path` at a supported model directory with `config.json`; build
+  the native target so its pinned converter scripts are available and install
+  the upstream converter's optional dependencies in the interpreter selected by
+  Cortex. Override it with `CORTEX_CPP_CONVERTER_PYTHON`; set
+  `CORTEX_LLAMA_CPP_SOURCE_DIR` if the source tree is elsewhere.
+- Legacy `.pt`, `.pth`, `.bin`, or `.ckpt` pickle checkpoints may execute code
+  during conversion. Only enable `allow_unsafe_legacy_checkpoint_conversion`
+  for a trusted legacy LLaMA checkpoint. Arbitrary training `.ckpt` files are
+  not universally supported; export them to a supported HF directory or GGUF.
+- Converted files use `CORTEX_CPP_CACHE_DIR` or the user's cache directory by
+  default. Ensure enough free disk space for the source and converted model.
+- The adapter currently supports text generation and embeddings, not
+  projector-based vision or arbitrary task endpoints. Use a separate build
+  directory for each target GPU; CUDA, Metal, or Vulkan needs the matching SDK
+  and llama.cpp options. See `native/README.md`; `gpu_layers = 0` selects CPU.
+
+### Legacy `runtime = "cortex"` Python backend is unavailable
+
+- Existing configs use `llama-cpp-python` inside a separate supervised process.
+  Install `cortex-llmhoster[embedded]` in the selected interpreter only if you
+  need to keep that legacy runtime. New configurations should use `cortex-cpp`.
+
 ### `GGUF model file not found`
 
 - Check that `model_path` points to an existing `.gguf` file, not a directory,
@@ -137,8 +168,11 @@ own machine; Cortex does not promise a specific tokens-per-second rate.
 - Authentication is controlled by `CORTEX_API_AUTH_ENABLED` or
   `[server].api_auth_enabled`. When unset, it defaults on if a non-empty
   `CORTEX_API_KEY` or `CORTEX_ADMIN_USERNAME` is configured and off otherwise.
-  When enabled, a non-empty `CORTEX_API_KEY` is required; admin account
-  variables are optional and add username/password dashboard sign-in.
+  When enabled, a non-empty API key is required; admin account variables are
+  optional and add username/password dashboard sign-in. `CORTEX_API_KEY` takes
+  precedence when non-empty. To use another variable, set `server.api_key_env`
+  or `CORTEX_API_KEY_ENV` to a valid environment name; it cannot reuse the
+  admin credential or auth-toggle variables.
 - For account sign-in, configure both `CORTEX_ADMIN_USERNAME` and
   `CORTEX_ADMIN_PASSWORD` alongside the API key in the environment or ignored
   project-root `.env`. If no account is configured, the login form defaults to
@@ -150,7 +184,13 @@ own machine; Cortex does not promise a specific tokens-per-second rate.
   listener.
 - Successful sign-in creates a signed 30-day HttpOnly cookie; passwords and API
   keys are not stored in browser storage or the cookie. API clients can continue
-  sending `Authorization: Bearer <key>`.
+  sending `Authorization: Bearer <key>`. Sign-in is limited to 10 attempts per
+  client per minute; honor the `Retry-After` header before trying again. Admin
+  API responses are sent with `Cache-Control: no-store`.
+- If a cookie-authenticated browser mutation returns `csrf_origin_rejected`,
+  the request needs same-origin `Origin`, `Referer`, or Fetch Metadata. Configure
+  a reverse proxy to preserve the external scheme/host with `X-Forwarded-Proto`
+  and `X-Forwarded-Host`; non-browser API clients can use a bearer key instead.
 - If credentials change, restart Cortex and sign in again. Changing the API key
   or either account credential invalidates old sessions; use **Log out** to remove
   the current browser session.
@@ -164,6 +204,8 @@ own machine; Cortex does not promise a specific tokens-per-second rate.
 
 - Confirm the configured port (default `8624`) is not occupied. Try a different
   port with `server.port`, `CORTEX_PORT`, or `--port`.
+- The listen host must be an IP address or DNS hostname such as `127.0.0.1`,
+  `::1`, `localhost`, or `0.0.0.0`; do not include a URL scheme or port.
 - With the default `127.0.0.1` listener, open Cortex from the same computer at
   `http://127.0.0.1:<port>/`.
 - For a container or intentional LAN access, configure the appropriate listen
@@ -180,6 +222,10 @@ The dashboard writes its overlay next to `cortex.toml` by default; set
 `CORTEX_ADMIN_CONFIG` if that location is read-only or unsuitable.
 
 ## API and model errors
+
+Every HTTP response includes an `X-Request-ID`. For local-runtime transport
+errors, the server log includes the same ID; include it when correlating a client
+failure with terminal output.
 
 ### `model_not_found`
 
@@ -207,6 +253,19 @@ Start the model in the dashboard and wait for its health check to pass. Check
 its runtime error/log output. If no default is selected, provide a `model` in
 the request or configure a default model. Only the default is started at
 application startup.
+
+### `model_request_failed` (HTTP 500)
+
+Cortex hit an unexpected error while preparing the local-runtime request. The
+response intentionally omits internal details; correlate `X-Request-ID` with
+the terminal traceback and avoid sharing logs that contain private paths or
+secrets.
+
+### `model_server_unavailable` (HTTP 502)
+
+Cortex could not reach the local runtime. Check that the runtime is still
+running, its configured health path responds, and the selected model's port has
+not been taken by another process.
 
 ### `request_too_large` (HTTP 413)
 
@@ -240,20 +299,25 @@ space as well as raising the size limit.
 - The update installs into the Python environment used by the running Cortex
   process. After success, stop and restart Cortex. Do not close the process
   while pip is installing.
-- The root-level `updater.sh` / `updater.bat` scripts require Git and the
-  checkout to already be on `arena/b3072048-cortex-llmhoster`; they deliberately
-  do not switch to `main`. Check `git branch --show-current` before running.
-- Each script creates a timestamped JSON backup under `backups/` before fetching.
-  If a fast-forward is blocked by local changes or divergent commits, the backup
-  remains intact; resolve or stash the changes, then rerun the updater.
-- These scripts update all tracked checkout files, then reinstall the project
-  with the selected Python. Copy `.env.example` to `.env` and set `2PY2` if you
-  need to choose that interpreter. Restart Cortex LLMHoster after the update.
-- If the updater cannot complete, stop Cortex LLMHoster, obtain the official
-  source archive, activate the same environment, and run `python -m pip install
-  --upgrade --force-reinstall .` from the extracted project folder. Local
-  weights and configuration are separate files and are not replaced by this
-  command.
+- The root-level `updater.sh` / `updater.bat` scripts require Git and network
+  access to GitHub, but not Python, pip, or a virtual environment. The checkout
+  must already be on `arena/b3072048-cortex-llmhoster`; they never switch to
+  `main`. Check `git branch --show-current` before running.
+- Each script backs up repository `*.json` files under `backups/` before cloning.
+  The scripts use `git clone --branch arena/b3072048-cortex-llmhoster
+  https://github.com/codero-sus/Cortex_LLMHoster.git` into a temporary folder,
+  then fast-forward the existing checkout from that clone.
+- A local edit or divergent commit prevents the fast-forward; the scripts do not
+  force-reset. The JSON backup remains available. Resolve or stash local changes
+  and rerun the updater.
+- The root scripts synchronize source files only; they do not install Python
+  package changes. If an update adds a dependency, install it separately into
+  the environment Cortex uses, then restart Cortex LLMHoster.
+- If the built-in installer cannot complete, stop Cortex LLMHoster, obtain the
+  official source archive, activate the same environment, and run `python -m
+  pip install --upgrade --force-reinstall .` from the extracted project folder.
+  Local weights and configuration are separate files and are not replaced by
+  this command.
 
 ## Still stuck?
 

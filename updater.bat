@@ -1,12 +1,13 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-rem Cortex LLMHoster source updater. Updates only the current project branch.
+rem Clone and fast-forward only the fixed Cortex LLMHoster update branch.
 set "UPDATE_BRANCH=arena/b3072048-cortex-llmhoster"
+set "REPOSITORY_URL=https://github.com/codero-sus/Cortex_LLMHoster.git"
 set "PROJECT_ROOT="
 
 for /f "delims=" %%R in ('git -C "%~dp0." rev-parse --show-toplevel 2^>nul') do set "PROJECT_ROOT=%%R"
 if not defined PROJECT_ROOT (
-    echo Error: this updater must run inside a Git checkout.
+    echo Error: run this updater from a Git checkout of Cortex LLMHoster.
     exit /b 1
 )
 pushd "%PROJECT_ROOT%" || exit /b 1
@@ -15,21 +16,13 @@ set "CURRENT_BRANCH="
 for /f "delims=" %%B in ('git branch --show-current 2^>nul') do set "CURRENT_BRANCH=%%B"
 if not "%CURRENT_BRANCH%"=="%UPDATE_BRANCH%" (
     echo Error: expected branch "%UPDATE_BRANCH%"; currently on "%CURRENT_BRANCH%".
-    echo Cortex LLMHoster updater will not switch to or update main.
-    popd
-    exit /b 1
-)
-git remote get-url origin >nul 2>nul
-if errorlevel 1 (
-    echo Error: this checkout has no Git remote named origin.
+    echo The updater will not switch to or update main.
     popd
     exit /b 1
 )
 
-set "STAMP="
-for /f "delims=" %%T in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMddTHHmmssZ" 2^>nul') do set "STAMP=%%T"
-if not defined STAMP set "STAMP=%RANDOM%-%RANDOM%"
-set "BACKUP_ROOT=%PROJECT_ROOT%\backups\json-%STAMP%"
+rem Keep every repository JSON file before source files are fast-forwarded.
+set "BACKUP_ROOT=%PROJECT_ROOT%\backups\json-%RANDOM%-%RANDOM%-%RANDOM%"
 if exist "%BACKUP_ROOT%" set "BACKUP_ROOT=%BACKUP_ROOT%-%RANDOM%"
 mkdir "%BACKUP_ROOT%" 2>nul
 if errorlevel 1 (
@@ -37,9 +30,7 @@ if errorlevel 1 (
     popd
     exit /b 1
 )
-
-rem Copy every project JSON file while excluding Git, environments, caches, and prior backups.
-robocopy "%PROJECT_ROOT%" "%BACKUP_ROOT%" *.json /S /COPY:DAT /R:1 /W:1 /XD "%PROJECT_ROOT%\.git" "%PROJECT_ROOT%\.venv" "%PROJECT_ROOT%\venv" "%PROJECT_ROOT%\backups" "%PROJECT_ROOT%\node_modules" "%PROJECT_ROOT%\build" "%PROJECT_ROOT%\dist" >nul
+robocopy "%PROJECT_ROOT%" "%BACKUP_ROOT%" *.json /S /COPY:DAT /R:1 /W:1 /XD "%PROJECT_ROOT%\.git" "%PROJECT_ROOT%\.venv" "%PROJECT_ROOT%\venv" "%PROJECT_ROOT%\backups" "%PROJECT_ROOT%\node_modules" "%PROJECT_ROOT%\build" "%PROJECT_ROOT%\dist" "%PROJECT_ROOT%\.cache" "%PROJECT_ROOT%\.pytest_cache" "%PROJECT_ROOT%\.mypy_cache" "%PROJECT_ROOT%\.ruff_cache" "%PROJECT_ROOT%\.tox" "%PROJECT_ROOT%\.nox" "%PROJECT_ROOT%\__pycache__" "%PROJECT_ROOT%\coverage" "%PROJECT_ROOT%\out" "%PROJECT_ROOT%\target" "%PROJECT_ROOT%\.next" "%PROJECT_ROOT%\.nuxt" "%PROJECT_ROOT%\.svelte-kit" "%PROJECT_ROOT%\.turbo" "%PROJECT_ROOT%\.vite" "%PROJECT_ROOT%\.parcel-cache" >nul
 set "ROBOCOPY_CODE=%ERRORLEVEL%"
 if %ROBOCOPY_CODE% GEQ 8 (
     echo Error: JSON backup failed with robocopy exit code %ROBOCOPY_CODE%.
@@ -48,52 +39,43 @@ if %ROBOCOPY_CODE% GEQ 8 (
 )
 echo JSON backup created at: %BACKUP_ROOT%
 
-set "REMOTE_REF=refs/remotes/origin/%UPDATE_BRANCH%"
-echo Fetching all tracked project-file updates from origin/%UPDATE_BRANCH% ...
-git fetch origin "%UPDATE_BRANCH%:%REMOTE_REF%"
-if errorlevel 1 (
-    echo Error: could not fetch branch "%UPDATE_BRANCH%". No branch switch was attempted.
-    popd
-    exit /b 1
-)
-git merge --ff-only "%REMOTE_REF%"
-if errorlevel 1 (
-    echo Error: fast-forward update failed. Local changes are preserved; resolve them and rerun.
-    popd
-    exit /b 1
-)
-echo Cortex LLMHoster repository files are updated from %UPDATE_BRANCH%.
+set "CLONE_ROOT=%TEMP%\Cortex_LLMHoster-update-%RANDOM%-%RANDOM%-%RANDOM%"
+if exist "%CLONE_ROOT%" set "CLONE_ROOT=%CLONE_ROOT%-%RANDOM%"
+echo Cloning branch %UPDATE_BRANCH% from %REPOSITORY_URL% ...
+git clone --branch "%UPDATE_BRANCH%" "%REPOSITORY_URL%" "%CLONE_ROOT%"
+if errorlevel 1 goto :clone_failed
 
-set "BOOTSTRAP_PYTHON="
-for /f "tokens=1,* delims==" %%A in ('set 2PY2 2^>nul') do if /i "%%A"=="2PY2" set "BOOTSTRAP_PYTHON=%%B"
-if not defined BOOTSTRAP_PYTHON if exist "%PROJECT_ROOT%\.env" for /f "usebackq eol=# tokens=1,* delims==" %%A in ("%PROJECT_ROOT%\.env") do if /i "%%A"=="2PY2" set "BOOTSTRAP_PYTHON=%%B"
-if not defined BOOTSTRAP_PYTHON if exist "%PROJECT_ROOT%\python.env" for /f "usebackq eol=# delims=" %%L in ("%PROJECT_ROOT%\python.env") do if not defined BOOTSTRAP_PYTHON set "BOOTSTRAP_PYTHON=%%L"
-for /f "tokens=1,* delims==" %%A in ("%BOOTSTRAP_PYTHON%") do if /i "%%A"=="2PY2" set "BOOTSTRAP_PYTHON=%%B"
-set "BOOTSTRAP_PYTHON=%BOOTSTRAP_PYTHON:"=%"
-set "BOOTSTRAP_PYTHON=%BOOTSTRAP_PYTHON:'=%"
-if not defined BOOTSTRAP_PYTHON if exist "%PROJECT_ROOT%\.venv\Scripts\python.exe" set "BOOTSTRAP_PYTHON=%PROJECT_ROOT%\.venv\Scripts\python.exe"
-if not defined BOOTSTRAP_PYTHON for /f "delims=" %%P in ('where python.exe 2^>nul') do if not defined BOOTSTRAP_PYTHON set "BOOTSTRAP_PYTHON=%%P"
-if not defined BOOTSTRAP_PYTHON (
-    echo Error: source files are updated, but Python was not found to refresh the install.
-    popd
-    exit /b 1
-)
-set "PYTHONPATH=%PROJECT_ROOT%\src;%PYTHONPATH%"
-set "SELECTED_PYTHON="
-for /f "delims=" %%P in ('"%BOOTSTRAP_PYTHON%" -c "from pathlib import Path; from cortex_llmhoster.python_runtime import resolve_python_executable; print(resolve_python_executable(project_root=Path.cwd()))"') do set "SELECTED_PYTHON=%%P"
-if not defined SELECTED_PYTHON (
-    echo Error: could not resolve the configured Python interpreter.
-    popd
-    exit /b 1
-)
-"%SELECTED_PYTHON%" -m pip install --upgrade --no-input --editable "%PROJECT_ROOT%"
-if errorlevel 1 (
-    echo Error: source files updated, but package installation failed.
-    popd
-    exit /b 1
+set "CLONED_BRANCH="
+for /f "delims=" %%B in ('git -C "%CLONE_ROOT%" branch --show-current 2^>nul') do set "CLONED_BRANCH=%%B"
+if not "%CLONED_BRANCH%"=="%UPDATE_BRANCH%" (
+    echo Error: Git cloned unexpected branch "%CLONED_BRANCH%". No checkout files were changed.
+    goto :update_failed
 )
 
-echo Cortex LLMHoster update complete. Restart the running server to load the new files.
+echo Fast-forwarding the existing checkout from the cloned branch...
+git fetch --no-tags "%CLONE_ROOT%" "refs/heads/%UPDATE_BRANCH%:refs/remotes/origin/%UPDATE_BRANCH%"
+if errorlevel 1 goto :update_failed
+git merge --ff-only "refs/remotes/origin/%UPDATE_BRANCH%"
+if errorlevel 1 goto :update_failed
+
+rmdir /s /q "%CLONE_ROOT%" 2>nul
+echo Cortex LLMHoster source updated from %UPDATE_BRANCH%.
+echo This updater uses Git only; it does not require Python, pip, or a virtual environment.
+echo Restart Cortex LLMHoster to load the updated source.
 echo JSON backup retained at: %BACKUP_ROOT%
 popd
 exit /b 0
+
+:clone_failed
+echo Error: could not clone branch "%UPDATE_BRANCH%". No checkout files were changed.
+echo JSON backup retained at: %BACKUP_ROOT%
+if exist "%CLONE_ROOT%" rmdir /s /q "%CLONE_ROOT%" 2>nul
+popd
+exit /b 1
+
+:update_failed
+echo Error: fast-forward update failed. Local changes are preserved; resolve them and rerun.
+echo JSON backup retained at: %BACKUP_ROOT%
+if exist "%CLONE_ROOT%" rmdir /s /q "%CLONE_ROOT%" 2>nul
+popd
+exit /b 1

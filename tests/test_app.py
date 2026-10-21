@@ -8,15 +8,20 @@ from contextlib import asynccontextmanager
 import httpx
 import orjson
 import pytest
+from starlette.datastructures import Headers
+from starlette.requests import ClientDisconnect, Request
+from starlette.routing import Route
 
 from cortex_llmhoster.app import (
     _missing_capabilities,
+    _read_limited_json_body,
     _request_timeout,
     _required_capabilities,
     _response_headers,
     create_app,
 )
 from cortex_llmhoster.config import ModelConfig, Settings
+from cortex_llmhoster.http_utils import content_length_from_headers
 
 
 def test_http_timeout_profiles_are_reused_without_freezing_config_values() -> None:
@@ -29,14 +34,23 @@ def test_http_timeout_profiles_are_reused_without_freezing_config_values() -> No
     assert updated.read == 60.0
 
 
+def test_content_length_parser_rejects_duplicate_fields() -> None:
+    headers = Headers(raw=[(b"content-length", b"4"), (b"content-length", b"4")])
+
+    with pytest.raises(ValueError, match="appear at most once"):
+        content_length_from_headers(headers)
+
+
 def test_response_headers_filter_standard_and_connection_nominated_hop_headers() -> None:
     response = httpx.Response(
         200,
         headers={
             "content-type": "application/json",
             "connection": "x-internal, keep-alive",
+            "proxy-connection": "keep-alive",
             "x-internal": "discard",
             "x-visible": "keep",
+            "set-cookie": "cortex_session=untrusted",
         },
     )
 
@@ -69,6 +83,19 @@ def test_specific_task_ids_satisfy_existing_endpoint_capabilities(
 
     assert required_capabilities == {required}
     assert not _missing_capabilities(required_capabilities, frozenset({declared}))
+
+
+def test_text_prompts_that_mention_media_filenames_remain_text_requests() -> None:
+    body = {
+        "messages": [
+            {
+                "role": "user",
+                "content": "Explain why movie.mp4 and data:image/png;base64 are examples.",
+            }
+        ]
+    }
+
+    assert _required_capabilities("chat/completions", body) == {"text_generation"}
 
 
 def test_custom_task_ids_can_gate_matching_local_runtime_paths() -> None:
@@ -152,6 +179,51 @@ def make_settings(**overrides: object) -> Settings:
     return Settings(**values)  # type: ignore[arg-type]
 
 
+@pytest.mark.asyncio
+async def test_request_id_is_echoed_and_forwarded_to_the_local_runtime() -> None:
+    observed: dict[str, str] = {}
+
+    async def upstream(request: httpx.Request) -> httpx.Response:
+        observed["request_id"] = request.headers["x-request-id"]
+        return httpx.Response(200, json={"ok": True}, headers={"x-request-id": "backend-id"})
+
+    app = create_app(make_settings(api_key=None), transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "public-name", "messages": []},
+            headers={"x-request-id": "trace-123.safe"},
+        )
+        generated = await client.get("/health")
+        invalid = await client.get("/health", headers={"x-request-id": "bad id"})
+
+    assert response.status_code == 200
+    assert observed["request_id"] == "trace-123.safe"
+    assert response.headers["x-request-id"] == "trace-123.safe"
+    assert len(generated.headers["x-request-id"]) == 32
+    assert generated.headers["x-request-id"].isalnum()
+    assert invalid.headers["x-request-id"].isalnum()
+    assert " " not in invalid.headers["x-request-id"]
+
+
+@pytest.mark.asyncio
+async def test_request_id_is_present_on_unhandled_server_errors() -> None:
+    async def fail(_: Request):
+        raise RuntimeError("internal test detail")
+
+    app = create_app(make_settings(api_key=None))
+    app.router.routes.append(Route("/__test/unhandled-error", fail, methods=["GET"]))
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://cortex.test") as client:
+        response = await client.get("/__test/unhandled-error")
+
+    request_id = response.headers["x-request-id"]
+    assert response.status_code == 500
+    assert len(request_id) == 32
+    assert int(request_id, 16) >= 0
+    assert "internal test detail" not in response.text
+
+
 @asynccontextmanager
 async def open_client(app, *, fake_local_server: bool = True) -> AsyncIterator[httpx.AsyncClient]:
     async with (
@@ -165,6 +237,30 @@ async def open_client(app, *, fake_local_server: bool = True) -> AsyncIterator[h
             # Test the API adapter without launching a real llama-server process.
             app.state.runtime_manager.local_base_url = lambda model: "http://127.0.0.1:12345/v1"
         yield client
+
+
+@pytest.mark.asyncio
+async def test_unexpected_local_runtime_failure_is_sanitized_and_closes_metrics() -> None:
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        raise RuntimeError("private backend detail")
+
+    app = create_app(
+        make_settings(api_key=None),
+        transport=httpx.MockTransport(upstream),
+    )
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": "public-name", "messages": []},
+        )
+
+    metrics = app.state.metrics.snapshot()
+    assert response.status_code == 500
+    assert response.json()["error"]["code"] == "model_request_failed"
+    assert "private backend detail" not in response.text
+    assert response.headers["x-request-id"]
+    assert metrics["in_flight"] == 0
+    assert metrics["failed_requests"] == 1
 
 
 @pytest.mark.asyncio
@@ -283,9 +379,7 @@ async def test_declared_custom_task_path_is_checked_and_receives_the_runtime_mod
     )
     app = create_app(settings, transport=httpx.MockTransport(upstream))
     async with open_client(app) as client:
-        response = await client.post(
-            "/v1/extensions/speech-translation", json={"input": "audio"}
-        )
+        response = await client.post("/v1/extensions/speech-translation", json={"input": "audio"})
 
     assert response.status_code == 200
     assert observed["body"]["model"] == "runtime-model"  # type: ignore[index]
@@ -474,6 +568,59 @@ async def test_api_auth_protects_models_and_inference_routes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_json_body_reader_reports_client_disconnect_as_a_bad_request() -> None:
+    async def disconnected_receive():
+        raise ClientDisconnect
+
+    request = Request(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [],
+            "client": ("testclient", 123),
+            "server": ("testserver", 80),
+        },
+        receive=disconnected_receive,
+    )
+
+    body, error = await _read_limited_json_body(request, 1024)
+
+    assert body is None
+    assert error is not None
+    assert error.status_code == 400
+    assert orjson.loads(error.body)["error"]["code"] == "request_body_interrupted"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("body", (b"[]", b"null", b"42"))
+async def test_inference_rejects_non_object_json_bodies(body: bytes) -> None:
+    called = False
+
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        nonlocal called
+        called = True
+        return httpx.Response(200)
+
+    app = create_app(make_settings(api_key=None), transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions?model=public-name",
+            content=body,
+            headers={"content-type": "application/json"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "invalid_request_body"
+    assert called is False
+
+
+@pytest.mark.asyncio
 async def test_json_body_limit_is_enforced_before_model_server_call() -> None:
     called = False
 
@@ -496,6 +643,24 @@ async def test_json_body_limit_is_enforced_before_model_server_call() -> None:
     assert response.status_code == 413
     assert response.json()["error"]["code"] == "request_too_large"
     assert called is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("content_length", ("+1", "1.0", "1, 1"))
+async def test_json_request_rejects_ambiguous_content_length(content_length: str) -> None:
+    app = create_app(make_settings(api_key=None))
+    async with open_client(app) as client:
+        response = await client.post(
+            "/v1/chat/completions",
+            content=b"{}",
+            headers={
+                "content-type": "application/json",
+                "content-length": content_length,
+            },
+        )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == "Invalid Content-Length header."
 
 
 @pytest.mark.asyncio
@@ -541,6 +706,29 @@ async def test_local_runtime_connection_failure_returns_service_unavailable() ->
 
 
 @pytest.mark.asyncio
+async def test_model_lists_and_inference_responses_are_not_cacheable() -> None:
+    async def upstream(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={"ok": True},
+            headers={"cache-control": "public, max-age=60"},
+        )
+
+    app = create_app(make_settings(api_key=None), transport=httpx.MockTransport(upstream))
+    async with open_client(app) as client:
+        models = await client.get("/v1/models")
+        inference = await client.post(
+            "/v1/chat/completions", json={"model": "public-name", "messages": []}
+        )
+
+    for response in (models, inference):
+        assert response.status_code == 200
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["pragma"] == "no-cache"
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.asyncio
 async def test_health_and_readiness_are_lightweight() -> None:
     app = create_app(Settings())
     async with open_client(app) as client:
@@ -549,7 +737,9 @@ async def test_health_and_readiness_are_lightweight() -> None:
 
     assert health_response.status_code == 200
     assert health_response.json() == {"status": "ok"}
+    assert health_response.headers["cache-control"] == "no-store"
     assert readiness_response.status_code == 503
+    assert readiness_response.headers["cache-control"] == "no-store"
     assert readiness_response.json()["reason"] == "no_models_configured"
 
 

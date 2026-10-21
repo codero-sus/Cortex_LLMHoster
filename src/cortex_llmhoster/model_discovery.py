@@ -145,7 +145,7 @@ def model_search_roots(configured_model_paths: Iterable[str | None] = ()) -> lis
     candidates: list[Path] = []
     configured_roots = os.environ.get("CORTEX_MODELS_DIR", "")
     candidates.extend(
-        Path(value).expanduser()
+        Path(value.strip()).expanduser()
         for value in configured_roots.split(os.pathsep)
         if value.strip()
     )
@@ -167,7 +167,7 @@ def model_search_roots(configured_model_paths: Iterable[str | None] = ()) -> lis
     for candidate in candidates:
         try:
             root = candidate.resolve(strict=True)
-        except OSError:
+        except (OSError, RuntimeError):
             continue
         if root.is_dir() and root not in seen:
             roots.append(root)
@@ -200,8 +200,7 @@ def discover_local_model_files(
                     directory_names[:] = sorted(
                         name
                         for name in directory_names
-                        if not name.startswith(".")
-                        and not (current / name).is_symlink()
+                        if not name.startswith(".") and not (current / name).is_symlink()
                     )
                 for filename in filenames:
                     if not filename.lower().endswith(".gguf"):
@@ -212,7 +211,7 @@ def discover_local_model_files(
                         if not resolved.is_file():
                             continue
                         stat = resolved.stat()
-                    except OSError:
+                    except (OSError, RuntimeError):
                         continue
                     found.setdefault(
                         resolved,
@@ -302,8 +301,8 @@ def detect_model_capabilities(
     is_audio_generation = _matches(context, _AUDIO_GENERATION_MARKERS)
     is_text_to_image = _matches(context, _TEXT_TO_IMAGE_MARKERS)
     is_image_to_image = _matches(context, _IMAGE_TO_IMAGE_MARKERS)
-    is_image_generation = is_text_to_image or is_image_to_image or _matches(
-        context, _IMAGE_GENERATION_MARKERS
+    is_image_generation = (
+        is_text_to_image or is_image_to_image or _matches(context, _IMAGE_GENERATION_MARKERS)
     )
     is_image_to_video = _matches(context, _IMAGE_TO_VIDEO_MARKERS)
     is_text_to_video = _matches(context, _TEXT_TO_VIDEO_MARKERS)

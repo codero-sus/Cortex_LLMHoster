@@ -12,6 +12,8 @@ __pycache__/
 coverage.xml
 build/
 dist/
+native/build/
+native/build-*/
 
 # Local credentials/configuration
 .env

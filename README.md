@@ -1,8 +1,11 @@
 # Cortex LLMHoster
 
 Cortex LLMHoster is a **free-to-use local model hoster** for permitted personal,
-non-commercial use. It manages llama.cpp GGUF models directly and can supervise
-other local inference engines through an OpenAI-compatible command runtime.
+non-commercial use. It includes a Cortex-managed native C++ GGUF host built on
+the llama.cpp inference core, can manage an external llama.cpp server, and can
+supervise other local inference engines through an OpenAI-compatible command
+runtime. A legacy Python-binding GGUF runtime remains for existing
+configurations, but is not the recommended model-loading path.
 
 **No Ollama required. No cloud inference account or cloud API key required.**
 Cortex routes inference to model servers running on your own machine; prompts
@@ -23,9 +26,11 @@ licenses; these are not bundled or automatically downloaded.
 The adaptable runtime layer can host text/chat, embeddings, vision, OCR, audio
 understanding/transcription/generation, image generation, and video tasks when
 the selected local engine and model actually implement them. No single runtime
-or model provides every modality. Cortex routes requests to the chosen local
-process; it does not create unsupported model capabilities or silently translate
-incompatible APIs.
+or model provides every modality. Cortex's native C++ GGUF host focuses on
+text generation and embeddings; use the external llama.cpp runtime or a suitable
+custom server for projector-based vision, audio, video, or other tasks. Cortex
+routes requests to the chosen local process; it does not create unsupported model
+capabilities or silently translate incompatible APIs.
 
 Efficiency controls include CPU-only operation, optional GPU offload, quantized
 GGUF model support, memory mapping, configurable context and batches, KV-cache
@@ -51,9 +56,14 @@ Visit the [project website](https://the-codero.web.app/) for more from Codero-Su
 
 ## Highlights
 
-- **Two local runtime modes:** first-class llama.cpp/GGUF hosting plus a
-  supervised command adapter for any local engine that exposes OpenAI-compatible
-  HTTP endpoints.
+- **Four managed runtime modes:** Cortex's native C++ GGUF host (no external
+  `llama-server` or Python inference binding), the retained legacy Python
+  binding runtime, an external llama.cpp server, and a supervised command
+  adapter for other local OpenAI-compatible engines. The C++ host uses the
+  llama.cpp inference core; it is not a new inference engine. The dashboard
+  includes optional command templates for vLLM, SGLang, TGI, and MLX-LM; they
+  prefill arguments but do not install engines. See
+  [`SERVER_OPTIONS.md`](SERVER_OPTIONS.md) for choices and use cases.
 - **Task/capability registry:** choose common text, vision/VLM, OCR, image,
   audio, video, embeddings, reranking, and moderation tasks in the grouped model
   form, or enter custom task IDs. Known routes accept both broad capabilities
@@ -72,14 +82,16 @@ Visit the [project website](https://the-codero.web.app/) for more from Codero-Su
 - **Memory-aware loading:** only the configured default local model starts
   automatically. Other models can be started and stopped from the dashboard.
 - **Manual software updater:** the dashboard updater checks the pinned source
-  branch when requested. Root-level `updater.sh` and `updater.bat` fast-forward
-  the complete tracked checkout only from `arena/b3072048-cortex-llmhoster`, first
-  backing up repository JSON files under `backups/`, then reinstalling the local
-  project with the selected Python interpreter. Neither updater switches to
-  `main`; restart Cortex LLMHoster after updating.
+  branch when requested. Root-level `updater.sh` and `updater.bat` first back up
+  repository JSON files under `backups/`, then run `git clone --branch
+  arena/b3072048-cortex-llmhoster https://github.com/codero-sus/Cortex_LLMHoster.git`
+  in a temporary folder and fast-forward the checkout from that clone. They need
+  Git and network access only—not Python, pip, or a virtual environment—and
+  never switch to `main`. Restart Cortex LLMHoster after updating.
 - **Local account sign-in:** optionally configure a single dashboard username
   and password. A successful sign-in creates a signed HttpOnly cookie; API
-  clients may continue to authenticate with the local bearer key.
+  clients may continue to authenticate with the local bearer key. Sign-in
+  attempts are throttled, and admin API responses are marked no-store.
 - **Lightweight browser UI:** manage models, runtimes and task declarations;
   inspect hardware; chat; use a same-origin modality/API workbench; browse a
   paginated Hugging Face model cookbook with an offline curated fallback; and
@@ -110,7 +122,7 @@ python3.11 -m venv .venv
 . .venv/bin/activate
 python -m pip install .
 cp cortex.example.toml cortex.toml
-# Edit cortex.toml: set model_path to an existing local GGUF file.
+# Edit cortex.toml: set model_path to a local GGUF or supported source model.
 export CORTEX_API_KEY="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 python -m cortex_llmhoster
 ```
@@ -142,18 +154,18 @@ non-commercial terms in [`LICENSE`](LICENSE).
 ### Optional custom Python interpreter
 
 Cortex LLMHoster normally keeps using the interpreter that started it. To
-select a portable or embedded interpreter for the CLI, updater, and local command
-runtimes, add a `python.env` file in the project root containing one executable
-path (absolute, or relative to the project root). A line such as
+select a portable or embedded interpreter for the CLI and local command runtimes,
+add a `python.env` file in the project root containing one executable path
+(absolute, or relative to the project root). A line such as
 `2PY2=/path/to/python` is also accepted. This machine-specific file is ignored
 by Git.
 
 Alternatively, copy [`.env.example`](.env.example) to `.env` and set
 `2PY2=/absolute/path/to/python`. The CLI loads `.env` for interpreter and local
-account settings; root updater scripts read it to choose Python. `.env` is
-ignored by Git; only the sample is tracked. A process environment `2PY2` takes precedence, followed by
-`2PY2` in `.env`, then `python.env`, and finally the interpreter that started
-the command. On Linux or macOS:
+account settings. The root source updater uses Git only and does not read these
+Python settings. `.env` is ignored by Git; only the sample is tracked. A process
+environment `2PY2` takes precedence, followed by `2PY2` in `.env`, then
+`python.env`, and finally the interpreter that started the command. On Linux or macOS:
 
 ```bash
 cp .env.example .env
@@ -166,10 +178,12 @@ env '2PY2=/opt/portable-python/bin/python3' python -m cortex_llmhoster
 ```
 
 Cortex restarts its CLI under the selected interpreter when needed, so install
-Cortex and its dependencies into that interpreter first. The updater uses the
-same interpreter for pip, and `{python}` in a `runtime_command` resolves to it.
-On Linux/macOS shells where names beginning with a digit cannot be exported, use
-the `env '2PY2=…' command` form shown above or configure `python.env`.
+Cortex and its dependencies into that interpreter first. `{python}` in a
+`runtime_command` resolves to it. The root source updater only synchronizes the
+Git checkout; if an update introduces Python dependency changes, install them
+separately in your selected environment. On Linux/macOS shells where names
+beginning with a digit cannot be exported, use the `env '2PY2=…' command` form
+shown above or configure `python.env`.
 
 ## Multimodal models and local runtimes
 
@@ -216,7 +230,9 @@ runtime_command = [
 `{context_size}`, and `{python}` can also be used. `{python}` resolves to the
 selected interpreter described above. Use a local server/wrapper that implements
 the desired endpoints and a health path returning HTTP 2xx. `model_path` may be a
-file or directory and is optional if the runtime command does not need it.
+file or directory and is optional if the runtime command does not need it. Child
+runtimes inherit the normal process environment, but Cortex removes its API key,
+configured API-key environment variable, and dashboard password before launch.
 
 The dashboard's **Models** form has grouped task checkboxes and a custom task-ID
 field. Capability names are normalized to lowercase underscore IDs (hyphens are
@@ -276,7 +292,9 @@ controls:
 | `mlock` | Ask the OS to lock model weights in RAM; this can increase memory pressure and may require elevated permission. |
 | `flash_attn` | Select `auto`, `on`, or `off` when supported by the installed build/model. |
 | `embedding` | Enable the local embedding endpoint. |
-| `mmproj_path` | Optional GGUF multimodal projector file for a compatible model/build. |
+| `mmproj_path` | Optional GGUF multimodal projector file for a compatible `llama.cpp` build. |
+| `conversion_outtype` | For `cortex-cpp` source conversion only: `f16` (default), `q8_0`, or `f32`. |
+| `allow_unsafe_legacy_checkpoint_conversion` | Explicit opt-in for trusted legacy LLaMA pickle checkpoints only; pickle deserialization can execute code. |
 
 For a constrained CPU-only device, start with `gpu_layers = 0`, `parallel = 1`,
 a modest `context_size` (for example 1024–2048), and smaller batch sizes. For a
@@ -313,8 +331,12 @@ selected runtime's concurrency settings instead. The resolved CLI/config `host`,
 ## Configuration and dashboard
 
 `cortex.example.toml` contains a complete local-hosting example. Each model
-needs a unique public `id` and a supported local runtime: `llama.cpp` requires a
-`.gguf` file, while `command` starts a local OpenAI-compatible server using
+needs a unique public `id` and a supported local runtime: `cortex-cpp` loads
+GGUF directly in Cortex's supervised native C++ host, and can convert supported
+local Hugging Face/legacy LLaMA sources to cached GGUF (details and limitations
+in [`native/README.md`](native/README.md)); legacy `cortex` uses the optional
+`llama-cpp-python` binding; `llama.cpp` starts the external `llama-server`
+executable; and `command` starts another local OpenAI-compatible server using
 `runtime_command`. Declare supported tasks with `capabilities`. A single model
 is selected by default automatically; with multiple models, mark one with
 `default = true` or configure `[server].default_model`.
@@ -373,7 +395,11 @@ a model.
 | `CORTEX_ADMIN_CONFIG` | sibling `cortex.local.json` | Dashboard override file path. |
 | `CORTEX_HOST` / `CORTEX_PORT` | `127.0.0.1` / `8624` | Local-only listen address by default; use `0.0.0.0` only when intentionally exposing the service. |
 | `CORTEX_WORKERS` | `1` | Uvicorn worker count; local model hosting requires one. |
-| `CORTEX_LLAMA_SERVER` | `PATH` lookup | Path to the `llama-server` executable. |
+| `CORTEX_LLAMA_SERVER` | `PATH` lookup | Path to the external `llama-server` executable. |
+| `CORTEX_CPP_HOST` | `native/build/bin/cortex-gguf-host`, then `PATH` | Path to Cortex's native C++ GGUF host executable. |
+| `CORTEX_LLAMA_CPP_SOURCE_DIR` | Native CMake dependency checkout | llama.cpp source tree containing the optional model-converter scripts. |
+| `CORTEX_CPP_CONVERTER_PYTHON` | Selected Cortex Python | Interpreter for one-time optional HF/legacy model conversion; not used for inference. |
+| `CORTEX_CPP_CACHE_DIR` | Per-user cache (`~/.cache` or `%LOCALAPPDATA%`) | Directory for converted GGUF cache entries; remove stale files manually. |
 | `CORTEX_API_KEY` | unset | Local bearer secret; required when authentication is enabled and never a cloud-provider key. Omit it when authentication is disabled. |
 | `CORTEX_ADMIN_USERNAME` / `CORTEX_ADMIN_PASSWORD` | unset | Optional single local dashboard account. Set both alongside the required API key for account sign-in; credentials are never written to `cortex.local.json` or browser storage. |
 | `CORTEX_API_AUTH_ENABLED` | on iff a non-empty API key or admin username is configured | Enables/disables auth for admin and inference APIs. When on, a non-empty API key is required; the account is optional. `false` permits unauthenticated requests. The equivalent TOML field is `[server].api_auth_enabled`. |

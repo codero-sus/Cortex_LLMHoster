@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from cortex_llmhoster.model_discovery import detect_model_capabilities
+from cortex_llmhoster.model_discovery import detect_model_capabilities, discover_local_model_files
 
 
 @pytest.mark.parametrize(
@@ -52,3 +52,19 @@ def test_vision_projector_suggests_vision_for_a_compatible_text_model(tmp_path) 
 def test_capability_detection_rejects_missing_local_paths(tmp_path) -> None:
     with pytest.raises(ValueError, match="does not exist"):
         detect_model_capabilities(str(tmp_path / "missing.gguf"))
+
+
+def test_model_discovery_skips_symlink_loops(tmp_path, monkeypatch) -> None:
+    model_directory = tmp_path / "models"
+    model_directory.mkdir()
+    loop = model_directory / "loop.gguf"
+    try:
+        loop.symlink_to(loop)
+    except OSError as exc:
+        pytest.skip(f"Symlinks are unavailable: {exc}")
+    monkeypatch.setenv("CORTEX_MODELS_DIR", f"  {model_directory}  ")
+
+    result = discover_local_model_files()
+
+    assert result["files"] == []
+    assert str(model_directory.resolve()) in result["search_roots"]
