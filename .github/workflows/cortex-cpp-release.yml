@@ -75,22 +75,51 @@ jobs:
         shell: pwsh
         run: |
           $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere was not found at $vswhere" }
           $vsPath = & $vswhere -latest -products '*' `
             -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
             -property installationPath
           if (-not $vsPath) { throw 'Could not locate the Visual Studio C++ toolchain.' }
-          $redistRoot = Join-Path $vsPath 'VC\Redist\MSVC'
-          $openmp = Get-ChildItem -Path $redistRoot -Filter vcomp140.dll -File -Recurse |
-            Where-Object { $_.FullName -match '\\x64\\Microsoft\.VC143\.OpenMP\\vcomp140\.dll$' } |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $openmp) { throw 'Could not locate the redistributable vcomp140.dll.' }
-          $redistNotice = Get-ChildItem -Path $redistRoot -Filter Redist.txt -File -Recurse |
-            Sort-Object FullName -Descending |
-            Select-Object -First 1
-          if (-not $redistNotice) { throw 'Could not locate the Microsoft VC redist license notice.' }
-          Copy-Item -LiteralPath $openmp.FullName -Destination 'build/bin/vcomp140.dll'
-          Copy-Item -LiteralPath $redistNotice.FullName -Destination 'build/bin/vcomp140-redist.txt'
+
+          $searchRoots = @()
+          $visualStudioRedist = Join-Path $vsPath 'VC\Redist'
+          if (Test-Path -LiteralPath $visualStudioRedist) { $searchRoots += $visualStudioRedist }
+          if ($env:VCToolsRedistDir -and (Test-Path -LiteralPath $env:VCToolsRedistDir)) {
+            $searchRoots += $env:VCToolsRedistDir
+          }
+          $searchRoots = $searchRoots | Select-Object -Unique
+          if (-not $searchRoots) { throw "No Visual Studio redistributable directory found under $vsPath" }
+
+          $openmpCandidates = foreach ($root in $searchRoots) {
+            Get-ChildItem -Path $root -Filter vcomp140.dll -File -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '(?i)\\x64\\[^\\]*OpenMP[^\\]*\\vcomp140\.dll$' }
+          }
+          $openmp = $openmpCandidates | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $openmp) {
+            throw "Could not locate x64 vcomp140.dll in the Visual Studio redistributable paths: $($searchRoots -join ', ')"
+          }
+
+          $redistNotices = @(
+            foreach ($root in $searchRoots) {
+              Get-ChildItem -Path $root -Filter Redist.txt -File -Recurse -ErrorAction SilentlyContinue
+            }
+          )
+          $redistNotice = $redistNotices | Sort-Object FullName -Descending | Select-Object -First 1
+          $binaryDir = Join-Path $PWD 'build/bin'
+          if (-not (Test-Path -LiteralPath $binaryDir)) { throw "CMake output directory was not found: $binaryDir" }
+          Copy-Item -LiteralPath $openmp.FullName -Destination (Join-Path $binaryDir 'vcomp140.dll')
+          if ($redistNotice) {
+            Copy-Item -LiteralPath $redistNotice.FullName -Destination (Join-Path $binaryDir 'vcomp140-redist.txt')
+          } else {
+            $noticeText = @"
+          Microsoft Visual C++ OpenMP runtime redistribution notice
+          vcomp140.dll is copied unmodified from the Visual Studio VC\\Redist redistributable tree.
+          Redistribution is subject to the applicable Microsoft Visual Studio license terms and Distributable Code list:
+          https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution
+          "@
+            $noticeText | Set-Content -Encoding utf8 (Join-Path $binaryDir 'vcomp140-redist.txt')
+          }
+          Write-Host "Bundled $($openmp.FullName)"
 
       - name: Package platform runtime bundle
         shell: bash
