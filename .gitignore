@@ -1,0 +1,27 @@
+# Python environments and bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Test/build artifacts
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+build/
+dist/
+native/build/
+native/build-*/
+
+# Local credentials/configuration
+.env
+.env.*
+!.env.example
+python.env
+cortex.toml
+cortex.local.json
+
+# Updater backups contain machine-local JSON configuration
+backups/
