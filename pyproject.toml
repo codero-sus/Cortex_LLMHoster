@@ -1,0 +1,53 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cortex-llmhoster"
+version = "0.2.0"
+description = "Free-to-use local multimodal model hosting for non-commercial use"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "LicenseRef-Cortex-Personal-NonCommercial-NoModification-NoRedistribution"
+license-files = ["LICENSE"]
+authors = [{ name = "codero-sus" }]
+classifiers = ["License :: Other/Proprietary License"]
+dependencies = [
+  "httpx>=0.27,<1",
+  "orjson>=3.10,<4",
+  "python-multipart>=0.0.9,<1",
+  "python-dotenv>=1.0,<2",
+  "starlette>=0.40,<1",
+  "uvicorn[standard]>=0.30,<1",
+]
+
+[project.urls]
+Homepage = "https://the-codero.web.app/"
+Repository = "https://github.com/codero-sus/Cortex_LLMHoster"
+Author = "https://github.com/codero-sus"
+
+[project.optional-dependencies]
+test = [
+  "pytest>=8,<9",
+  "pytest-asyncio>=0.24,<2",
+]
+embedded = ["llama-cpp-python>=0.3.8,<1"]
+
+[project.scripts]
+cortex-llmhoster = "cortex_llmhoster.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cortex_llmhoster"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/cortex_llmhoster/static/index.html" = "cortex_llmhoster/static/index.html"
+"src/config/api.json" = "cortex_llmhoster/api.json"
+"src/config/example.api.json" = "cortex_llmhoster/example.api.json"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

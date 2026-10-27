@@ -1,0 +1,360 @@
+name: Build Cortex C++ runtimes
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/cortex-cpp-release.yml"
+      - "native/**"
+      - "src/cortex_llmhoster/native_installer.py"
+      - "src/cortex_llmhoster/runtime.py"
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/cortex-cpp-release.yml"
+      - "native/**"
+      - "src/cortex_llmhoster/native_installer.py"
+      - "src/cortex_llmhoster/runtime.py"
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish/update the rolling cortex-cpp release (main branch only)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cortex-cpp-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: linux-x86_64
+            cmake_options: "-DGGML_NATIVE=OFF -DGGML_SSE42=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_F16C=OFF -DGGML_FMA=OFF -DGGML_BMI2=OFF"
+          - os: windows-2022
+            target: windows-x86_64
+            cmake_options: "-DGGML_NATIVE=OFF -DGGML_SSE42=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_F16C=OFF -DGGML_FMA=OFF -DGGML_BMI2=OFF -DCORTEX_STATIC_MSVC_RUNTIME=ON"
+          - os: macos-15
+            target: macos-arm64
+            cmake_options: "-DGGML_NATIVE=OFF -DGGML_METAL=ON"
+          - os: macos-15-intel
+            target: macos-x86_64
+            cmake_options: "-DGGML_NATIVE=OFF -DGGML_SSE42=OFF -DGGML_AVX=OFF -DGGML_AVX2=OFF -DGGML_F16C=OFF -DGGML_FMA=OFF -DGGML_BMI2=OFF"
+    steps:
+      - name: Check out Cortex
+        uses: actions/checkout@v7
+
+      - name: Set up Python for bundle packaging
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Configure native runtimes
+        shell: bash
+        run: >-
+          cmake -S native -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DCORTEX_BUILD_LLAMA_SERVER=ON
+          ${{ matrix.cmake_options }}
+
+      - name: Compile Cortex C++ host, llama-server, and quantizer
+        run: cmake --build build --config Release --target cortex-gguf-host llama-server llama-quantize --parallel 2
+
+      - name: Bundle the MSVC OpenMP runtime
+        if: matrix.target == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+          if (-not (Test-Path -LiteralPath $vswhere)) { throw "vswhere was not found at $vswhere" }
+          $vsPath = & $vswhere -latest -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -property installationPath
+          if (-not $vsPath) { throw 'Could not locate the Visual Studio C++ toolchain.' }
+
+          $searchRoots = @()
+          $visualStudioRedist = Join-Path $vsPath 'VC\Redist'
+          if (Test-Path -LiteralPath $visualStudioRedist) { $searchRoots += $visualStudioRedist }
+          if ($env:VCToolsRedistDir -and (Test-Path -LiteralPath $env:VCToolsRedistDir)) {
+            $searchRoots += $env:VCToolsRedistDir
+          }
+          $searchRoots = $searchRoots | Select-Object -Unique
+          if (-not $searchRoots) { throw "No Visual Studio redistributable directory found under $vsPath" }
+
+          $openmpCandidates = foreach ($root in $searchRoots) {
+            Get-ChildItem -Path $root -Filter vcomp140.dll -File -Recurse -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -match '(?i)\\x64\\[^\\]*OpenMP[^\\]*\\vcomp140\.dll$' }
+          }
+          $openmp = $openmpCandidates | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $openmp) {
+            throw "Could not locate x64 vcomp140.dll in the Visual Studio redistributable paths: $($searchRoots -join ', ')"
+          }
+
+          $redistNotices = @(
+            foreach ($root in $searchRoots) {
+              Get-ChildItem -Path $root -Filter Redist.txt -File -Recurse -ErrorAction SilentlyContinue
+            }
+          )
+          $redistNotice = $redistNotices | Sort-Object FullName -Descending | Select-Object -First 1
+          $binaryDir = Join-Path $PWD 'build/bin'
+          if (-not (Test-Path -LiteralPath $binaryDir)) { throw "CMake output directory was not found: $binaryDir" }
+          Copy-Item -LiteralPath $openmp.FullName -Destination (Join-Path $binaryDir 'vcomp140.dll')
+          if ($redistNotice) {
+            Copy-Item -LiteralPath $redistNotice.FullName -Destination (Join-Path $binaryDir 'vcomp140-redist.txt')
+          } else {
+            $noticeText = @"
+          Microsoft Visual C++ OpenMP runtime redistribution notice
+          vcomp140.dll is copied unmodified from the Visual Studio VC\\Redist redistributable tree.
+          Redistribution is subject to the applicable Microsoft Visual Studio license terms and Distributable Code list:
+          https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution
+          "@
+            $noticeText | Set-Content -Encoding utf8 (Join-Path $binaryDir 'vcomp140-redist.txt')
+          }
+          Write-Host "Bundled $($openmp.FullName)"
+
+      - name: Package platform runtime bundle
+        shell: bash
+        env:
+          CORTEX_RELEASE_TARGET: ${{ matrix.target }}
+        run: |
+          python - <<'PY'
+          import os
+          import subprocess
+          import zipfile
+          from pathlib import Path
+
+          target = os.environ["CORTEX_RELEASE_TARGET"]
+          suffix = ".exe" if target.startswith("windows-") else ""
+          binary_names = (
+              f"cortex-gguf-host{suffix}",
+              f"llama-server{suffix}",
+              f"llama-quantize{suffix}",
+          )
+          binary_dir = Path("build/bin")
+          binaries = [binary_dir / name for name in binary_names]
+          missing = [str(path) for path in binaries if not path.is_file()]
+          if missing:
+              raise SystemExit("Build output is missing: " + ", ".join(missing))
+
+          runtime_libraries = {}
+          if target.startswith("linux-"):
+              for binary in binaries:
+                  dependencies = subprocess.run(
+                      ["ldd", str(binary)], check=True, capture_output=True, text=True
+                  ).stdout
+                  for line in dependencies.splitlines():
+                      name, separator, location = line.partition("=>")
+                      if separator and name.strip() == "libgomp.so.1":
+                          dependency_path = location.strip().split()[0]
+                          runtime_libraries["libgomp.so.1"] = Path(dependency_path).resolve()
+              if not runtime_libraries:
+                  raise SystemExit("The Linux runtime bundles did not resolve libgomp.so.1")
+          elif target.startswith("windows-"):
+              openmp_dll = binary_dir / "vcomp140.dll"
+              if not openmp_dll.is_file():
+                  raise SystemExit("The Windows bundle is missing the MSVC OpenMP runtime DLL")
+              runtime_libraries["vcomp140.dll"] = openmp_dll
+          elif target.startswith("macos-"):
+              for binary in binaries:
+                  dependencies = subprocess.run(
+                      ["otool", "-L", str(binary)], check=True, capture_output=True, text=True
+                  ).stdout.splitlines()[1:]
+                  non_system = [
+                      line.strip().split(" (", 1)[0]
+                      for line in dependencies
+                      if not line.strip().startswith(("/System/Library/", "/usr/lib/"))
+                  ]
+                  if non_system:
+                      raise SystemExit(
+                          f"{binary} has non-system macOS dependencies that are not bundled: {non_system}"
+                      )
+
+          licenses = {
+              "LICENSE-Cortex.txt": Path("LICENSE"),
+              "THIRD-PARTY-LICENSES/llama.cpp.txt": Path("build/_deps/llama_cpp-src/LICENSE"),
+              "THIRD-PARTY-LICENSES/cpp-httplib.txt": Path("build/_deps/httplib-src/LICENSE"),
+              "THIRD-PARTY-LICENSES/cpp-httplib-upstream.txt": Path("build/_deps/llama_cpp-src/vendor/cpp-httplib/LICENSE"),
+              "THIRD-PARTY-LICENSES/nlohmann-json.txt": Path("build/_deps/nlohmann_json-src/LICENSE.MIT"),
+              "THIRD-PARTY-LICENSES/nlohmann-json-upstream.txt": Path("build/_deps/llama_cpp-src/licenses/LICENSE-jsonhpp"),
+          }
+          if "libgomp.so.1" in runtime_libraries:
+              licenses["THIRD-PARTY-LICENSES/libgomp-copyright.txt"] = Path(
+                  "/usr/share/doc/libgomp1/copyright"
+              )
+          if "vcomp140.dll" in runtime_libraries:
+              licenses["THIRD-PARTY-LICENSES/Microsoft-VC-Redist.txt"] = (
+                  Path("build/bin/vcomp140-redist.txt")
+              )
+          missing_licenses = [str(path) for path in licenses.values() if not path.is_file()]
+          miniaudio_header = Path("build/_deps/llama_cpp-src/vendor/miniaudio/miniaudio.h")
+          if not miniaudio_header.is_file():
+              raise SystemExit(f"Build output is missing license source: {miniaudio_header}")
+          if missing_licenses:
+              raise SystemExit("Build output is missing license files: " + ", ".join(missing_licenses))
+          miniaudio_text = miniaudio_header.read_text(encoding="utf-8")
+          license_marker = "This software is available as a choice of the following licenses."
+          license_offset = miniaudio_text.find(license_marker)
+          if license_offset < 0:
+              raise SystemExit("Could not locate the miniaudio license notice")
+          miniaudio_license = miniaudio_text[license_offset:].rstrip().removesuffix("*/").rstrip()
+
+          archive = Path(f"cortex-cpp-{target}.zip")
+          with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as bundle:
+              for binary in binaries:
+                  bundle.write(binary, arcname=binary.name)
+              for archive_name, library_path in runtime_libraries.items():
+                  bundle.write(library_path, arcname=archive_name)
+              for archive_name, license_path in licenses.items():
+                  bundle.write(license_path, arcname=archive_name)
+              bundle.writestr("THIRD-PARTY-LICENSES/miniaudio.txt", miniaudio_license + "\n")
+          print(f"Created {archive} ({archive.stat().st_size} bytes)")
+          PY
+
+      - name: Upload runtime bundle
+        uses: actions/upload-artifact@v7
+        with:
+          name: cortex-cpp-${{ matrix.target }}
+          path: cortex-cpp-${{ matrix.target }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish rolling cortex-cpp release
+    needs: build
+    if: >-
+      ${{
+        github.ref == 'refs/heads/main' &&
+        (github.event_name == 'push' ||
+         (github.event_name == 'workflow_dispatch' && inputs.publish_release))
+      }}
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - name: Check out the successful build commit
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download platform runtime bundles
+        uses: actions/download-artifact@v8
+        with:
+          pattern: cortex-cpp-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Create runtime manifest
+        env:
+          CORTEX_SOURCE_COMMIT: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import zipfile
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          release_dir = Path("release-assets")
+          bundles = sorted(release_dir.glob("cortex-cpp-*.zip"))
+          expected_targets = {
+              "linux-x86_64",
+              "windows-x86_64",
+              "macos-x86_64",
+              "macos-arm64",
+          }
+          actual_targets = {bundle.stem.removeprefix("cortex-cpp-") for bundle in bundles}
+          if actual_targets != expected_targets:
+              raise SystemExit(
+                  f"Expected bundles for {sorted(expected_targets)}, got {sorted(actual_targets)}"
+              )
+
+          assets = {}
+          for bundle in bundles:
+              target = bundle.stem.removeprefix("cortex-cpp-")
+              digest_builder = hashlib.sha256()
+              with bundle.open("rb") as source:
+                  for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                      digest_builder.update(chunk)
+              suffix = ".exe" if target.startswith("windows-") else ""
+              expected_binaries = sorted(
+                  f"{name}{suffix}"
+                  for name in ("cortex-gguf-host", "llama-server", "llama-quantize")
+              )
+              expected_libraries = (
+                  ["libgomp.so.1"]
+                  if target.startswith("linux-")
+                  else ["vcomp140.dll"]
+                  if target.startswith("windows-")
+                  else []
+              )
+              with zipfile.ZipFile(bundle) as archive:
+                  members = set(archive.namelist())
+                  binaries = sorted(name for name in expected_binaries if name in members)
+                  runtime_libraries = sorted(name for name in expected_libraries if name in members)
+              if binaries != expected_binaries or runtime_libraries != expected_libraries:
+                  raise SystemExit(
+                      f"{bundle.name} is incomplete: binaries={binaries}, libraries={runtime_libraries}"
+                  )
+              assets[target] = {
+                  "name": bundle.name,
+                  "size": bundle.stat().st_size,
+                  "sha256": digest_builder.hexdigest(),
+                  "binaries": binaries,
+                  "runtime_libraries": runtime_libraries,
+              }
+
+          manifest = {
+              "schema_version": 1,
+              "release_tag": "cortex-cpp",
+              "source_commit": os.environ["CORTEX_SOURCE_COMMIT"],
+              "llama_cpp_commit": "620d2225cc436ab0b001e3200e590e3b286ef9ab",
+              "created_at": datetime.now(timezone.utc).isoformat(),
+              "assets": assets,
+          }
+          manifest_path = release_dir / "cortex-cpp-manifest.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+          print(manifest_path.read_text(encoding="utf-8"))
+          PY
+
+      - name: Move the rolling tag to this successful build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag --force cortex-cpp "$GITHUB_SHA"
+          git push --force origin refs/tags/cortex-cpp
+
+      - name: Create or update the cortex-cpp release
+        uses: softprops/action-gh-release@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          tag_name: cortex-cpp
+          name: Cortex C++ runtimes (rolling release)
+          body: |
+            Automatically built from `${{ github.sha }}` by the Cortex C++ workflow.
+
+            Each platform ZIP contains the Cortex native GGUF host (`cortex-gguf-host`),
+            upstream `llama-server`, `llama-quantize`, and their third-party license notices.
+            The binaries use the pinned llama.cpp commit recorded in `cortex-cpp-manifest.json`.
+            This is a mutable rolling release; the exact tag is `cortex-cpp`.
+          files: |
+            release-assets/cortex-cpp-linux-x86_64.zip
+            release-assets/cortex-cpp-windows-x86_64.zip
+            release-assets/cortex-cpp-macos-x86_64.zip
+            release-assets/cortex-cpp-macos-arm64.zip
+            release-assets/cortex-cpp-manifest.json
+          fail_on_unmatched_files: true
+          overwrite_files: true
+          preserve_order: true
+          make_latest: true
+          draft: false
+          prerelease: false
