@@ -4,6 +4,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cctype>
@@ -670,6 +671,9 @@ class Engine {
       return true;
     };
 
+    // Reuse the one-token decode batch across generated tokens instead of
+    // allocating and freeing llama_batch storage for every decode step.
+    BatchGuard decode_batch(1);
     for (std::uint32_t index = 0; index < token_limit; ++index) {
       const auto token = llama_sampler_sample(sampler.get(), runtime_.context.get(), -1);
       if (llama_vocab_is_eog(runtime_.vocab, token)) {
@@ -691,9 +695,8 @@ class Engine {
         break;
       }
 
-      BatchGuard batch(1);
-      set_single_token(batch.batch, token, next_position);
-      if (llama_decode(runtime_.context.get(), batch.batch) != 0) {
+      set_single_token(decode_batch.batch, token, next_position);
+      if (llama_decode(runtime_.context.get(), decode_batch.batch) != 0) {
         throw ApiError(500, "native_inference_failed", "The native model could not decode the next token.");
       }
       ++next_position;
@@ -720,9 +723,9 @@ class Engine {
     std::vector<float> pooled(static_cast<std::size_t>(runtime_.embedding_size), 0.0F);
     std::size_t count = 0;
     std::size_t offset = 0;
+    BatchGuard batch(static_cast<std::int32_t>(runtime_.batch_size));
     while (offset < tokens.size()) {
       const auto batch_count = std::min<std::size_t>(runtime_.batch_size, tokens.size() - offset);
-      BatchGuard batch(static_cast<std::int32_t>(batch_count));
       set_batch_tokens(batch.batch, tokens, offset, batch_count, true);
       if (llama_decode(runtime_.context.get(), batch.batch) != 0) {
         throw ApiError(500, "native_inference_failed", "The native model could not compute embeddings.");
@@ -774,25 +777,29 @@ class Engine {
   }
 
   std::string token_piece(llama_token token) const {
-    std::vector<char> buffer(256);
-    auto size = llama_token_to_piece(runtime_.vocab, token, buffer.data(),
-                                     static_cast<std::int32_t>(buffer.size()), 0, true);
-    if (size < 0) {
-      buffer.resize(static_cast<std::size_t>(-size));
-      size = llama_token_to_piece(runtime_.vocab, token, buffer.data(),
-                                  static_cast<std::int32_t>(buffer.size()), 0, true);
+    std::array<char, 256> small_buffer{};
+    auto size = llama_token_to_piece(runtime_.vocab, token, small_buffer.data(),
+                                     static_cast<std::int32_t>(small_buffer.size()), 0, true);
+    if (size >= 0) {
+      return std::string(small_buffer.data(), static_cast<std::size_t>(size));
     }
+    if (size == std::numeric_limits<std::int32_t>::min()) {
+      throw ApiError(500, "native_inference_failed", "The native model emitted an invalid token.");
+    }
+    std::vector<char> large_buffer(static_cast<std::size_t>(-size));
+    size = llama_token_to_piece(runtime_.vocab, token, large_buffer.data(),
+                                static_cast<std::int32_t>(large_buffer.size()), 0, true);
     if (size < 0) {
       throw ApiError(500, "native_inference_failed", "The native model emitted an invalid token.");
     }
-    return std::string(buffer.data(), static_cast<std::size_t>(size));
+    return std::string(large_buffer.data(), static_cast<std::size_t>(size));
   }
 
   void evaluate_prompt(const std::vector<llama_token>& tokens, bool output_all) {
     std::size_t offset = 0;
+    BatchGuard batch(static_cast<std::int32_t>(runtime_.batch_size));
     while (offset < tokens.size()) {
       const auto batch_count = std::min<std::size_t>(runtime_.batch_size, tokens.size() - offset);
-      BatchGuard batch(static_cast<std::int32_t>(batch_count));
       set_batch_tokens(batch.batch, tokens, offset, batch_count, output_all);
       if (llama_decode(runtime_.context.get(), batch.batch) != 0) {
         throw ApiError(400, "context_length_exceeded", "The native model could not evaluate this prompt.");
