@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import httpx
+import pytest
+
+from cortex_llmhoster.app import create_app
+from cortex_llmhoster.config import ModelConfig, Settings
+
+
+@asynccontextmanager
+async def open_client(app) -> AsyncIterator[httpx.AsyncClient]:
+    async with (
+        app.router.lifespan_context(app),
+        httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://cortex.test",
+        ) as client,
+    ):
+        yield client
+
+
+def fake_server_file(tmp_path: Path) -> Path:
+    executable = tmp_path / "llama-server"
+    executable.write_text(
+        "#!/usr/bin/env python3\nimport time\nprint('stub server started', flush=True)\ntime.sleep(60)\n",
+        encoding="utf-8",
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+@pytest.mark.asyncio
+async def test_local_model_is_managed_and_served_through_cortex(tmp_path, monkeypatch) -> None:
+    model_path = tmp_path / "tiny.gguf"
+    model_path.write_bytes(b"stub model")
+    fake_server = fake_server_file(tmp_path)
+    observed: dict[str, object] = {}
+
+    async def mock_upstream(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        observed["url"] = str(request.url)
+        observed["body"] = await request.aread()
+        return httpx.Response(200, json={"id": "local-result", "choices": []})
+
+    monkeypatch.setattr(
+        "cortex_llmhoster.app.detect_hardware",
+        lambda: {
+            "platform": "test",
+            "cpu_count": 2,
+            "recommended_threads": 2,
+            "ram_total_gb": 4,
+            "ram_available_gb": 2,
+            "gpu": "test CPU",
+        },
+    )
+    settings = Settings(
+        models={
+            "tiny-local": ModelConfig(
+                id="tiny-local",
+                upstream_model="tiny-local",
+                runtime="llama.cpp",
+                model_path=str(model_path),
+                gpu_layers=0,
+                context_size=512,
+                batch_size=64,
+                ubatch_size=32,
+            )
+        },
+        default_model="tiny-local",
+        api_key="dashboard-secret",
+        llama_server_path=str(fake_server),
+    )
+    app = create_app(settings, transport=httpx.MockTransport(mock_upstream))
+
+    async with open_client(app) as client:
+        manager = app.state.runtime_manager
+        for _ in range(60):
+            if manager.state("tiny-local")["status"] == "running":
+                break
+            await asyncio.sleep(0.05)
+        assert manager.state("tiny-local")["status"] == "running"
+
+        response = await client.post(
+            "/v1/chat/completions",
+            headers={"Authorization": "Bearer dashboard-secret"},
+            json={
+                "model": "tiny-local",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": False,
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["id"] == "local-result"
+        assert str(observed["url"]).startswith("http://127.0.0.1:")
+        assert str(observed["url"]).endswith("/v1/chat/completions")
+
+        status = await client.get(
+            "/admin/api/runtime", headers={"Authorization": "Bearer dashboard-secret"}
+        )
+        assert status.status_code == 200
+        assert status.json()["models"]["tiny-local"]["status"] == "running"
+
+        stopped = await client.post(
+            "/admin/api/models/stop",
+            headers={"Authorization": "Bearer dashboard-secret"},
+            json={"id": "tiny-local"},
+        )
+        assert stopped.status_code == 200
+        assert stopped.json()["runtime"]["status"] == "stopped"
+
+        readiness = await client.get("/ready")
+        assert readiness.status_code == 503
+        assert readiness.json()["reason"] == "default_local_model_not_running"
+
+
+@pytest.mark.asyncio
+async def test_stop_all_models_stops_managed_runtimes_concurrently(tmp_path, monkeypatch) -> None:
+    models = {
+        model_id: ModelConfig(
+            id=model_id,
+            upstream_model=model_id,
+            model_path=f"/models/{model_id}.gguf",
+        )
+        for model_id in ("first", "second")
+    }
+    app = create_app(
+        Settings(
+            models=models,
+            default_model="first",
+            api_key="dashboard-secret",
+        ),
+        admin_config_path=tmp_path / "cortex.local.json",
+    )
+    async with open_client(app) as client:
+        manager = app.state.runtime_manager
+        active = 0
+        peak_active = 0
+        stopped: list[str] = []
+
+        async def fake_stop(model_id: str) -> dict[str, str]:
+            nonlocal active, peak_active
+            active += 1
+            peak_active = max(peak_active, active)
+            await asyncio.sleep(0.02)
+            active -= 1
+            stopped.append(model_id)
+            return {"id": model_id, "status": "stopped"}
+
+        monkeypatch.setattr(manager, "stop", fake_stop)
+        response = await client.post(
+            "/admin/api/models/stop-all",
+            headers={"Authorization": "Bearer dashboard-secret"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["ok"] is True
+        assert set(response.json()["stopped"]) == {"first", "second"}
+        assert set(stopped) == {"first", "second"}
+        assert peak_active == 2
+
+
+@pytest.mark.asyncio
+async def test_command_runtime_serves_openai_compatible_modality_end_to_end(tmp_path: Path) -> None:
+    backend = tmp_path / "openai_local_backend.py"
+    backend.write_text(
+        """from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+import sys
+
+args = sys.argv
+host = args[args.index('--host') + 1]
+port = int(args[args.index('--port') + 1])
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200 if self.path == '/health' else 404)
+        self.end_headers()
+        self.wfile.write(b'ok')
+    def do_POST(self):
+        size = int(self.headers.get('content-length', '0'))
+        payload = json.loads(self.rfile.read(size))
+        body = json.dumps({'path': self.path, 'model': payload.get('model')}).encode()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *_args):
+        pass
+
+HTTPServer((host, port), Handler).serve_forever()
+""",
+        encoding="utf-8",
+    )
+    model = ModelConfig(
+        id="local-ocr",
+        upstream_model="ocr-engine-alias",
+        runtime="command",
+        capabilities=("ocr",),
+        runtime_command=(
+            str(Path(sys.executable).resolve()),
+            str(backend),
+            "--host",
+            "{host}",
+            "--port",
+            "{port}",
+        ),
+    )
+    app = create_app(Settings(models={model.id: model}, default_model=model.id))
+
+    async with open_client(app) as client:
+        for _ in range(80):
+            state = app.state.runtime_manager.state(model.id)
+            if state["status"] == "running":
+                break
+            await asyncio.sleep(0.05)
+        assert app.state.runtime_manager.state(model.id)["status"] == "running"
+
+        response = await client.post(
+            "/v1/ocr",
+            json={"image": "data:image/png;base64,aGVsbG8="},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"path": "/v1/ocr", "model": "ocr-engine-alias"}
+
+
+@pytest.mark.asyncio
+async def test_builtin_cortex_runtime_uses_openai_gateway_routing_without_llama_server(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model_path = tmp_path / "embedded.gguf"
+    model_path.write_bytes(b"GGUF test fixture")
+    model = ModelConfig(
+        id="embedded-local",
+        upstream_model="embedded-engine-alias",
+        runtime="cortex",
+        model_path=str(model_path),
+        capabilities=("text_generation",),
+    )
+    observed: dict[str, object] = {}
+
+    async def mock_backend(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        observed["url"] = str(request.url)
+        observed["body"] = await request.aread()
+        return httpx.Response(200, json={"id": "embedded-result", "choices": []})
+
+    monkeypatch.setattr(
+        "cortex_llmhoster.runtime.build_cortex_runtime_command",
+        lambda _model, _port: [sys.executable, "-c", "import time; time.sleep(60)"],
+    )
+    app = create_app(
+        Settings(models={model.id: model}, default_model=model.id),
+        transport=httpx.MockTransport(mock_backend),
+    )
+
+    async with open_client(app) as client:
+        manager = app.state.runtime_manager
+        for _ in range(60):
+            if manager.state(model.id)["status"] == "running":
+                break
+            await asyncio.sleep(0.05)
+        state = manager.state(model.id)
+        response = await client.post(
+            "/v1/chat/completions",
+            json={"model": model.id, "messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        assert state["status"] == "running"
+        assert state["runtime"] == "cortex"
+        assert state["base_url"] == f"http://127.0.0.1:{state['port']}/v1"
+        stopped = await manager.stop(model.id)
+        assert stopped["status"] == "stopped"
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "embedded-result"
+    assert str(observed["url"]).startswith("http://127.0.0.1:")
+    assert str(observed["url"]).endswith("/v1/chat/completions")
+    assert b"embedded-engine-alias" in observed["body"]
+
+
+@pytest.mark.asyncio
+async def test_native_cortex_cpp_runtime_uses_gateway_without_python_or_llama_server(
+    tmp_path: Path, monkeypatch
+) -> None:
+    model_path = tmp_path / "native.gguf"
+    model_path.write_bytes(b"GGUF test fixture")
+    model = ModelConfig(
+        id="native-local",
+        upstream_model="native-engine-alias",
+        runtime="cortex-cpp",
+        model_path=str(model_path),
+        capabilities=("text_generation",),
+    )
+    observed: dict[str, object] = {}
+
+    async def mock_backend(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health":
+            return httpx.Response(200, json={"status": "ok"})
+        observed["url"] = str(request.url)
+        observed["body"] = await request.aread()
+        return httpx.Response(200, json={"id": "native-result", "choices": []})
+
+    monkeypatch.setattr(
+        "cortex_llmhoster.runtime._resolve_cortex_cpp_binary", lambda: "/opt/cortex-gguf-host"
+    )
+
+    class FakeProcess:
+        returncode: int | None = None
+        pid = 2468
+        stdout = None
+
+        def terminate(self) -> None:
+            self.returncode = 0
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+    async def fake_create_subprocess(*args: object, **kwargs: object) -> FakeProcess:
+        observed["command"] = args
+        observed["spawn_options"] = kwargs
+        return FakeProcess()
+
+    monkeypatch.setattr(
+        "cortex_llmhoster.runtime.asyncio.create_subprocess_exec", fake_create_subprocess
+    )
+    app = create_app(
+        Settings(models={model.id: model}, default_model=model.id),
+        transport=httpx.MockTransport(mock_backend),
+    )
+
+    async with open_client(app) as client:
+        manager = app.state.runtime_manager
+        for _ in range(60):
+            if manager.state(model.id)["status"] == "running":
+                break
+            await asyncio.sleep(0.05)
+        state = manager.state(model.id)
+        response = await client.post(
+            "/v1/chat/completions",
+            json={
+                "model": model.id,
+                "messages": [{"role": "user", "content": "hello"}],
+                "frequency_penalty": 0.4,
+                "presence_penalty": -0.2,
+            },
+        )
+        assert state["status"] == "running"
+        assert state["runtime"] == "cortex-cpp"
+        assert state["base_url"] == f"http://127.0.0.1:{state['port']}/v1"
+        native_command = observed["command"]
+        assert native_command[0] == "/opt/cortex-gguf-host"
+        assert "python" not in native_command[0].lower()
+        assert "llama-server" not in native_command[0]
+        assert native_command[native_command.index("--model-path") + 1] == str(model_path)
+        stopped = await manager.stop(model.id)
+        assert stopped["status"] == "stopped"
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "native-result"
+    assert str(observed["url"]).startswith("http://127.0.0.1:")
+    assert str(observed["url"]).endswith("/v1/chat/completions")
+    forwarded = json.loads(observed["body"])
+    assert forwarded["model"] == "native-engine-alias"
+    assert forwarded["frequency_penalty"] == 0.4
+    assert forwarded["presence_penalty"] == -0.2
