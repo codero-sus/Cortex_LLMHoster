@@ -1092,6 +1092,7 @@ def test_cortex_cpp_runtime_command_is_native_and_applies_gguf_tuning(
         context_size=4096,
         batch_size=512,
         ubatch_size=128,
+        parallel=2,
         flash_attn="on",
         cache_type_k="q8_0",
         cache_type_v="q8_0",
@@ -1113,12 +1114,28 @@ def test_cortex_cpp_runtime_command_is_native_and_applies_gguf_tuning(
     assert command[command.index("--context-size") + 1] == "4096"
     assert command[command.index("--batch-size") + 1] == "512"
     assert command[command.index("--ubatch-size") + 1] == "128"
+    assert command[command.index("--parallel") + 1] == "2"
     assert command[command.index("--cache-type-k") + 1] == "q8_0"
     assert "--no-mmap" in command
     assert "--mlock" in command
     assert "--embedding" in command
     assert "llama-server" not in command
     assert "python" not in command[0].lower()
+
+
+def test_cortex_cpp_runtime_builder_rejects_more_than_four_contexts(tmp_path: Path) -> None:
+    model_file = tmp_path / "native.gguf"
+    model_file.write_bytes(b"GGUF fixture")
+    model = ModelConfig(
+        id="native-too-many-contexts",
+        upstream_model="native-too-many-contexts",
+        runtime="cortex-cpp",
+        model_path=str(model_file),
+        parallel=5,
+    )
+
+    with pytest.raises(ValueError, match="supports 1 to 4 parallel requests"):
+        build_cortex_cpp_runtime_command(model, 8765, "/opt/cortex-gguf-host")
 
 
 def test_cortex_cpp_low_vram_profile_uses_native_memory_fit(tmp_path: Path) -> None:
@@ -1175,6 +1192,7 @@ def test_cortex_cpp_super_low_profile_uses_auto_fit_and_q4_cache(tmp_path: Path)
     command = build_cortex_cpp_runtime_command(model, 8765, "/opt/cortex-gguf-host")
 
     assert command[command.index("--gpu-layers") + 1] == "-2"
+    assert "--parallel" not in command
     assert command[command.index("--context-size") + 1] == "1024"
     assert command[command.index("--batch-size") + 1] == "64"
     assert command[command.index("--ubatch-size") + 1] == "16"

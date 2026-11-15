@@ -72,6 +72,7 @@ embedding = false
 # capabilities = ["text_generation", "embeddings"]
 # gpu_layers = 0
 # context_size = 2048
+# parallel = 1 # 1–4 native contexts; higher values use more RAM/VRAM
 # default = false
 #
 # For trusted legacy LLaMA .pt/.pth/.ckpt files only, explicitly opt in to

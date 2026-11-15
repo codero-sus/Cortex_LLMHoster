@@ -28,6 +28,7 @@ from .config import (
     CPP_QUANTIZED_OUTTYPES,
     CPP_QUANTIZER_OUTTYPES,
     LOCAL_RUNTIMES,
+    MAX_CORTEX_CPP_PARALLEL_REQUESTS,
     OPTIMIZATION_PRESETS,
     ModelConfig,
     Settings,
@@ -369,6 +370,14 @@ def build_cortex_cpp_runtime_command(
 
     if model.runtime != CORTEX_CPP_RUNTIME:
         raise ValueError("The native backend requires runtime='cortex-cpp'.")
+    if (
+        isinstance(model.parallel, bool)
+        or not isinstance(model.parallel, int)
+        or not 1 <= model.parallel <= MAX_CORTEX_CPP_PARALLEL_REQUESTS
+    ):
+        raise ValueError(
+            f"The native C++ backend supports 1 to {MAX_CORTEX_CPP_PARALLEL_REQUESTS} parallel requests."
+        )
     if not binary:
         raise ValueError("Cortex's native C++ host executable was not found.")
     selected_path = model_path if model_path is not None else model.model_path
@@ -449,6 +458,8 @@ def build_cortex_cpp_runtime_command(
         "--cache-type-v",
         cache_type_v,
     ]
+    if model.parallel > 1:
+        command.extend(("--parallel", str(model.parallel)))
     if not use_mmap:
         command.append("--no-mmap")
     if mlock:

@@ -380,6 +380,26 @@ def test_super_low_defaults_and_custom_model_tuning_are_preserved() -> None:
     assert custom.mlock is True
 
 
+@pytest.mark.parametrize(("parallel", "valid"), [(1, True), (4, True), (5, False)])
+def test_native_cpp_parallel_context_limit_is_validated(parallel: int, valid: bool) -> None:
+    payload = {
+        "models": [
+            {
+                "id": "native-parallel",
+                "runtime": "cortex-cpp",
+                "model_path": "/models/native.gguf",
+                "parallel": parallel,
+            }
+        ]
+    }
+    if valid:
+        model = Settings.from_mapping(payload, environ={}).models["native-parallel"]
+        assert model.parallel == parallel
+    else:
+        with pytest.raises(ConfigurationError, match="parallel must be at most 4"):
+            Settings.from_mapping(payload, environ={})
+
+
 def test_low_vram_and_native_auto_fit_are_validated_settings() -> None:
     settings = Settings.from_mapping(
         {
