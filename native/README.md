@@ -29,12 +29,14 @@ cmake --build native/build --target cortex-gguf-host --parallel 2
 cmake --build native/build --target llama-quantize --parallel 2
 ```
 
-The prompt-cache planner has a small native unit test that needs no model
-weights. Configure a separate test build and run it with CTest:
+The prompt-cache planner and concurrent request-slot pool have native unit
+tests that need no model weights. Configure a separate test build and run them
+with CTest:
 
 ```bash
 cmake -S native -B native/build-tests -DCORTEX_BUILD_TESTS=ON
-cmake --build native/build-tests --target cortex-prompt-cache-test --parallel 2
+cmake --build native/build-tests \
+  --target cortex-prompt-cache-test cortex-inference-slot-pool-test --parallel 2
 ctest --test-dir native/build-tests --output-on-failure
 ```
 
@@ -177,6 +179,16 @@ mmap, and mlock. Larger settings increase memory use. With Cortex C++,
 `gpu_layers = -1` selects memory-fit; external llama.cpp still requires a manual
 count. Q4 KV and short starting contexts can trade quality or conversation
 length for lower memory use.
+
+The native C++ runtime accepts `parallel = 1`–`4` (default `1`) to serve
+independent requests at the same time. Each slot owns a context, KV cache, and
+reusable batch buffer; model weights are shared. Memory use therefore grows
+with the number of slots, and the configured CPU thread counts apply per
+context. Keep `parallel = 1` on low-memory systems; with multiple slots, lower
+`threads`/`threads_batch` if CPU contention is excessive. This is an opt-in
+aggregate-throughput setting, not a single-request speedup claim, and results
+depend on model, hardware, and workload. The external `llama.cpp` server keeps
+its separate request-slot setting.
 
 For repeated text-generation requests, the native host keeps a one-entry token
 prefix cache alongside the context KV state. When a new prompt shares that

@@ -329,7 +329,7 @@ controls:
 | `threads` / `threads_batch` | CPU inference and prompt-processing threads; `0` selects a conservative, container-aware automatic count. CPU affinity/quota detection is cached for the process lifetime. |
 | `context_size` | Context window in tokens. Reducing it lowers KV-cache memory use. |
 | `batch_size` / `ubatch_size` | Prompt-processing batch limits; smaller values can reduce peak memory. |
-| `parallel` | llama.cpp request slots. Keep at `1` on low-memory systems. |
+| `parallel` | Concurrent request slots. Cortex C++ supports 1–4 independent contexts; extra slots use more RAM/VRAM. Keep at `1` on low-memory systems. |
 | `cache_type_k` / `cache_type_v` | KV-cache precision; quantized types such as `q8_0` can reduce memory use where supported. |
 | `use_mmap` | Memory-map model weights (enabled by default). |
 | `mlock` | Ask the OS to lock model weights in RAM; this can increase memory pressure and may require elevated permission. |

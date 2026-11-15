@@ -3,6 +3,7 @@
 #include <llama.h>
 #include <nlohmann/json.hpp>
 
+#include "inference_slot_pool.hpp"
 #include "prompt_cache.hpp"
 
 #include <algorithm>
@@ -27,6 +28,7 @@ namespace {
 
 using Json = nlohmann::json;
 constexpr std::size_t kMaxRequestBytes = 16 * 1024 * 1024;
+constexpr std::uint32_t kMaxParallelContexts = 4;
 constexpr std::uint32_t kDefaultMaxTokens = 256;
 constexpr std::size_t kMaxStopSequences = 16;
 constexpr std::size_t kMaxStopLength = 256;
@@ -54,6 +56,7 @@ struct Options {
   std::uint32_t context_size = 2048;
   std::uint32_t batch_size = 256;
   std::uint32_t ubatch_size = 64;
+  std::uint32_t parallel = 1;
   int threads = 0;
   int threads_batch = 0;
   int gpu_layers = 0;
@@ -137,6 +140,7 @@ void print_usage(const char* executable) {
             << "  --context-size N        Context tokens (default 2048)\n"
             << "  --batch-size N          Prompt batch size (default 256)\n"
             << "  --ubatch-size N         Physical micro-batch size (default 64)\n"
+            << "  --parallel N            Concurrent request contexts (1-4; default 1)\n"
             << "  --threads N             Decode threads; 0 lets the engine choose\n"
             << "  --threads-batch N       Prompt-processing threads\n"
             << "  --gpu-layers N          GPU offload layers (-1 = all, -2 = memory-fit, 0 = CPU)\n"
@@ -177,6 +181,8 @@ Options parse_options(int argc, char** argv) {
       options.batch_size = parse_u32(value_after(i, flag), flag);
     } else if (flag == "--ubatch-size") {
       options.ubatch_size = parse_u32(value_after(i, flag), flag);
+    } else if (flag == "--parallel") {
+      options.parallel = parse_u32(value_after(i, flag), flag);
     } else if (flag == "--threads") {
       options.threads = parse_int(value_after(i, flag), flag);
     } else if (flag == "--threads-batch") {
@@ -208,8 +214,10 @@ Options parse_options(int argc, char** argv) {
     throw std::runtime_error("Cortex's private GGUF process may only bind to 127.0.0.1.");
   }
   if (options.context_size < 128 || options.batch_size == 0 || options.ubatch_size == 0 ||
-      options.threads < 0 || options.threads_batch < 0 || options.gpu_layers < -2) {
-    throw std::runtime_error("Context, batch, thread, or GPU-layer settings are out of range.");
+      options.parallel == 0 || options.parallel > kMaxParallelContexts || options.threads < 0 ||
+      options.threads_batch < 0 || options.gpu_layers < -2) {
+    throw std::runtime_error(
+        "Context, batch, parallel, thread, or GPU-layer settings are out of range.");
   }
   options.batch_size = std::min(options.batch_size, options.context_size);
   options.ubatch_size = std::min(options.ubatch_size, options.batch_size);
@@ -486,17 +494,23 @@ struct BatchGuard {
 
 struct RuntimeModel {
   ModelPtr model{nullptr, llama_model_free};
-  ContextPtr context{nullptr, llama_free};
   const llama_vocab* vocab = nullptr;
   int embedding_size = 0;
   bool embeddings_enabled = false;
   std::string alias;
   std::uint32_t context_size = 0;
   std::uint32_t batch_size = 0;
-  std::mutex inference_mutex;
+};
+
+struct InferenceSlot {
+  ContextPtr context{nullptr, llama_free};
+  std::unique_ptr<BatchGuard> batch;
+  std::vector<llama_token> cached_tokens;
 };
 
 class Engine {
+  using SlotPool = cortex::native::InferenceSlotPool<InferenceSlot>;
+
  public:
   explicit Engine(const Options& options) {
     if (options.model_path.size() < 5 || lower(options.model_path.substr(options.model_path.size() - 5)) != ".gguf") {
@@ -573,16 +587,33 @@ class Engine {
     runtime_.context_size = options.context_size;
     runtime_.batch_size = options.batch_size;
 
-    runtime_.context.reset(llama_init_from_model(runtime_.model.get(), context_params));
-    if (!runtime_.context) {
-      throw std::runtime_error("The native inference context could not be created.");
+    std::vector<std::unique_ptr<InferenceSlot>> slots;
+    slots.reserve(options.parallel);
+    for (std::uint32_t index = 0; index < options.parallel; ++index) {
+      auto slot = std::make_unique<InferenceSlot>();
+      slot->context.reset(llama_init_from_model(runtime_.model.get(), context_params));
+      if (!slot->context) {
+        throw std::runtime_error(
+            "The native inference context pool could not be created. Reduce parallel requests, "
+            "context size, or GPU offload.");
+      }
+      const auto actual_context_size = llama_n_ctx(slot->context.get());
+      const auto actual_batch_size = llama_n_batch(slot->context.get());
+      if (index == 0) {
+        runtime_.context_size = actual_context_size;
+        runtime_.batch_size = actual_batch_size;
+      } else if (actual_context_size != runtime_.context_size ||
+                 actual_batch_size != runtime_.batch_size) {
+        throw std::runtime_error("Native inference contexts were created with inconsistent settings.");
+      }
+      slot->batch = std::make_unique<BatchGuard>(static_cast<std::int32_t>(runtime_.batch_size));
+      slots.push_back(std::move(slot));
     }
-    runtime_.context_size = llama_n_ctx(runtime_.context.get());
-    runtime_.batch_size = llama_n_batch(runtime_.context.get());
+    slots_ = std::make_unique<SlotPool>(std::move(slots));
   }
 
   ~Engine() {
-    runtime_.context.reset();
+    slots_.reset();
     runtime_.model.reset();
     if (backend_initialized_) {
       llama_backend_free();
@@ -620,19 +651,20 @@ class Engine {
   GenerationResult generate(const std::vector<llama_token>& prompt_tokens,
                            const SamplingOptions& sampling,
                            const std::function<bool(std::string_view)>& emit) {
-    std::lock_guard<std::mutex> guard(runtime_.inference_mutex);
+    auto slot_lease = slots_->acquire();
+    auto& slot = slot_lease.get();
     if (prompt_tokens.empty() || prompt_tokens.size() > runtime_.context_size) {
       throw ApiError(400, "context_length_exceeded", "The prompt exceeds the configured context size.");
     }
-    const auto prompt_eval_start = prepare_prompt_cache(prompt_tokens);
+    const auto prompt_eval_start = prepare_prompt_cache(slot, prompt_tokens);
     try {
-      evaluate_prompt(prompt_tokens, false, prompt_eval_start);
+      evaluate_prompt(slot, prompt_tokens, false, prompt_eval_start);
     } catch (...) {
-      llama_memory_clear(llama_get_memory(runtime_.context.get()), true);
-      cached_tokens_.clear();
+      llama_memory_clear(llama_get_memory(slot.context.get()), true);
+      slot.cached_tokens.clear();
       throw;
     }
-    cached_tokens_.assign(prompt_tokens.begin(), prompt_tokens.end());
+    slot.cached_tokens.assign(prompt_tokens.begin(), prompt_tokens.end());
 
     auto chain_params = llama_sampler_chain_default_params();
     SamplerPtr sampler(llama_sampler_chain_init(chain_params), llama_sampler_free);
@@ -680,11 +712,9 @@ class Engine {
       return true;
     };
 
-    // Reuse the one-token decode batch across generated tokens instead of
-    // allocating and freeing llama_batch storage for every decode step.
-    BatchGuard decode_batch(1);
+    // Each slot keeps its batch storage for reuse across requests and decode steps.
     for (std::uint32_t index = 0; index < token_limit; ++index) {
-      const auto token = llama_sampler_sample(sampler.get(), runtime_.context.get(), -1);
+      const auto token = llama_sampler_sample(sampler.get(), slot.context.get(), -1);
       if (llama_vocab_is_eog(runtime_.vocab, token)) {
         result.finish_reason = "stop";
         break;
@@ -704,11 +734,11 @@ class Engine {
         break;
       }
 
-      set_single_token(decode_batch.batch, token, next_position);
-      if (llama_decode(runtime_.context.get(), decode_batch.batch) != 0) {
+      set_single_token(slot.batch->batch, token, next_position);
+      if (llama_decode(slot.context.get(), slot.batch->batch) != 0) {
         throw ApiError(500, "native_inference_failed", "The native model could not decode the next token.");
       }
-      cached_tokens_.push_back(token);
+      slot.cached_tokens.push_back(token);
       ++next_position;
     }
     if (!client_disconnected && !filter.stopped() && !filter.finish(filtered_emit)) {
@@ -724,25 +754,25 @@ class Engine {
     if (runtime_.embedding_size <= 0) {
       throw ApiError(501, "backend_operation_unavailable", "The model has no embedding output.");
     }
-    std::lock_guard<std::mutex> guard(runtime_.inference_mutex);
+    auto slot_lease = slots_->acquire();
+    auto& slot = slot_lease.get();
     if (tokens.empty() || tokens.size() > runtime_.context_size) {
       throw ApiError(400, "context_length_exceeded", "The input exceeds the configured context size.");
     }
-    llama_memory_clear(llama_get_memory(runtime_.context.get()), true);
-    cached_tokens_.clear();
+    llama_memory_clear(llama_get_memory(slot.context.get()), true);
+    slot.cached_tokens.clear();
 
     std::vector<float> pooled(static_cast<std::size_t>(runtime_.embedding_size), 0.0F);
     std::size_t count = 0;
     std::size_t offset = 0;
-    BatchGuard batch(static_cast<std::int32_t>(runtime_.batch_size));
     while (offset < tokens.size()) {
       const auto batch_count = std::min<std::size_t>(runtime_.batch_size, tokens.size() - offset);
-      set_batch_tokens(batch.batch, tokens, offset, batch_count, true);
-      if (llama_decode(runtime_.context.get(), batch.batch) != 0) {
+      set_batch_tokens(slot.batch->batch, tokens, offset, batch_count, true);
+      if (llama_decode(slot.context.get(), slot.batch->batch) != 0) {
         throw ApiError(500, "native_inference_failed", "The native model could not compute embeddings.");
       }
       for (std::size_t i = 0; i < batch_count; ++i) {
-        const auto* values = llama_get_embeddings_ith(runtime_.context.get(), static_cast<std::int32_t>(i));
+        const auto* values = llama_get_embeddings_ith(slot.context.get(), static_cast<std::int32_t>(i));
         if (values == nullptr) {
           throw ApiError(501, "backend_operation_unavailable", "The model did not return token embeddings.");
         }
@@ -774,17 +804,18 @@ class Engine {
   const llama_model* model() const noexcept { return runtime_.model.get(); }
 
  private:
-  std::size_t prepare_prompt_cache(const std::vector<llama_token>& prompt_tokens) {
-    const auto plan = cortex::native::plan_prompt_cache(cached_tokens_, prompt_tokens);
-    auto* memory = llama_get_memory(runtime_.context.get());
+  std::size_t prepare_prompt_cache(InferenceSlot& slot,
+                                   const std::vector<llama_token>& prompt_tokens) {
+    const auto plan = cortex::native::plan_prompt_cache(slot.cached_tokens, prompt_tokens);
+    auto* memory = llama_get_memory(slot.context.get());
     auto keep = plan.keep_tokens;
     if (plan.clear_memory ||
-        (keep < cached_tokens_.size() &&
+        (keep < slot.cached_tokens.size() &&
          !llama_memory_seq_rm(memory, 0, static_cast<llama_pos>(keep), -1))) {
       llama_memory_clear(memory, true);
       keep = 0;
     }
-    cached_tokens_.resize(keep);
+    slot.cached_tokens.resize(keep);
     return keep;
   }
 
@@ -820,13 +851,12 @@ class Engine {
     return std::string(large_buffer.data(), static_cast<std::size_t>(size));
   }
 
-  void evaluate_prompt(const std::vector<llama_token>& tokens, bool output_all,
-                       std::size_t offset) {
-    BatchGuard batch(static_cast<std::int32_t>(runtime_.batch_size));
+  void evaluate_prompt(InferenceSlot& slot, const std::vector<llama_token>& tokens,
+                       bool output_all, std::size_t offset) {
     while (offset < tokens.size()) {
       const auto batch_count = std::min<std::size_t>(runtime_.batch_size, tokens.size() - offset);
-      set_batch_tokens(batch.batch, tokens, offset, batch_count, output_all);
-      if (llama_decode(runtime_.context.get(), batch.batch) != 0) {
+      set_batch_tokens(slot.batch->batch, tokens, offset, batch_count, output_all);
+      if (llama_decode(slot.context.get(), slot.batch->batch) != 0) {
         throw ApiError(400, "context_length_exceeded", "The native model could not evaluate this prompt.");
       }
       offset += batch_count;
@@ -834,7 +864,7 @@ class Engine {
   }
 
   RuntimeModel runtime_;
-  std::vector<llama_token> cached_tokens_;
+  std::unique_ptr<SlotPool> slots_;
   bool backend_initialized_ = false;
 };
 
@@ -1086,9 +1116,11 @@ int main(int argc, char** argv) {
     server.set_payload_max_length(kMaxRequestBytes);
     server.set_read_timeout(10, 0);
     server.set_write_timeout(300, 0);
-    server.new_task_queue = [] { return new httplib::ThreadPool(4); };
+    const auto server_workers = std::max<std::uint32_t>(4, options.parallel + 1);
+    server.new_task_queue = [server_workers] { return new httplib::ThreadPool(server_workers); };
     register_routes(server, engine, options, engine.model());
-    std::cerr << "Cortex native GGUF backend ready on 127.0.0.1:" << options.port << '\n';
+    std::cerr << "Cortex native GGUF backend ready on 127.0.0.1:" << options.port
+              << " with " << options.parallel << " inference context(s).\n";
     if (!server.listen(options.host.c_str(), static_cast<int>(options.port))) {
       std::cerr << "Cortex native GGUF backend failed to bind its loopback port.\n";
       return 2;

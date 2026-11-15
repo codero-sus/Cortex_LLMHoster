@@ -69,7 +69,7 @@ jobs:
           ${{ matrix.cmake_options }}
 
       - name: Compile Cortex C++ host, llama-server, quantizer, and unit tests
-        run: cmake --build build --config Release --target cortex-gguf-host llama-server llama-quantize cortex-prompt-cache-test --parallel 2
+        run: cmake --build build --config Release --target cortex-gguf-host llama-server llama-quantize cortex-prompt-cache-test cortex-inference-slot-pool-test --parallel 2
 
       - name: Run native unit tests
         run: ctest --test-dir build --build-config Release --output-on-failure

@@ -22,6 +22,7 @@ class ConfigurationError(ValueError):
 
 CORTEX_RUNTIME = "cortex"
 CORTEX_CPP_RUNTIME = "cortex-cpp"
+MAX_CORTEX_CPP_PARALLEL_REQUESTS = 4
 CORTEX_RUNTIMES = frozenset({CORTEX_RUNTIME, CORTEX_CPP_RUNTIME})
 GGUF_RUNTIMES = frozenset({"llama.cpp", *CORTEX_RUNTIMES})
 CPP_CONVERSION_OUTTYPES = frozenset(
@@ -578,6 +579,11 @@ class Settings:
             if ubatch_size > batch_size:
                 raise ConfigurationError(f"{prefix}.ubatch_size cannot exceed batch_size.")
             parallel = model_int("parallel", 1, 1)
+            if runtime == CORTEX_CPP_RUNTIME and parallel > MAX_CORTEX_CPP_PARALLEL_REQUESTS:
+                raise ConfigurationError(
+                    f"{prefix}.parallel must be at most {MAX_CORTEX_CPP_PARALLEL_REQUESTS} "
+                    "for the native C++ backend."
+                )
             flash_attn = row.get("flash_attn", "auto")
             if not isinstance(flash_attn, str) or flash_attn not in {"auto", "on", "off"}:
                 raise ConfigurationError(f"{prefix}.flash_attn must be auto, on, or off.")
